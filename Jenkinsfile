@@ -4,7 +4,7 @@ pipeline {
 
     environment {
         APP_NAME = 'prometric-app'
-        APP_IMAGE = 'prometric-dash-corrected-app:latest'
+        POSTGRES_NAME = 'prometric-postgres'
         COMPOSE_FILE = 'docker-compose.yml'
     }
 
@@ -25,6 +25,10 @@ pipeline {
             steps {
                 deleteDir()
 
+                echo '======================================'
+                echo ' GitHub → Jenkins'
+                echo '======================================'
+
                 checkout([
                     $class: 'GitSCM',
                     branches: [[name: '*/main']],
@@ -35,11 +39,19 @@ pipeline {
                 ])
 
                 sh '''
-                    echo "======================================"
-                    echo " GitHub → Jenkins"
-                    echo "======================================"
+                    set -e
+
+                    echo "📁 Repository:"
                     pwd
                     ls -la
+
+                    echo ""
+                    echo "📄 Fichiers Docker:"
+                    test -f Dockerfile
+                    test -f docker-compose.yml
+                    test -f package.json
+
+                    echo "✅ Repository récupéré"
                 '''
             }
         }
@@ -49,64 +61,209 @@ pipeline {
                 sh '''
                     set -e
 
-                    echo "======================================"
-                    echo " Docker Build"
-                    echo "======================================"
+                    echo '======================================'
+                    echo ' Docker Build'
+                    echo '======================================'
 
                     docker compose build --pull app
 
-                    echo "✅ Docker build terminé"
+                    echo ""
+                    echo "🔎 Vérification image..."
+
+                    docker image inspect prometric-dash-corrected-app:latest >/dev/null
+
+                    echo "✅ Image Docker construite"
                 '''
             }
         }
 
-        stage('DOCKER UP') {
-    steps {
-        sh '''
-            set -e
+        stage('DATABASE') {
+            steps {
+                sh '''
+                    set -e
 
-            echo "======================================"
-            echo " PostgreSQL"
-            echo "======================================"
+                    echo '======================================'
+                    echo ' PostgreSQL'
+                    echo '======================================'
 
-            if docker inspect prometric-postgres >/dev/null 2>&1; then
-                echo "✅ prometric-postgres existe déjà"
+                    if docker inspect "${POSTGRES_NAME}" >/dev/null 2>&1; then
 
-                if [ "$(docker inspect -f '{{.State.Running}}' prometric-postgres)" != "true" ]; then
-                    echo "🚀 Démarrage PostgreSQL..."
-                    docker start prometric-postgres
-                fi
-            else
-                echo "🚀 Création PostgreSQL..."
-                docker compose up -d postgres
-            fi
+                        echo "✅ Container ${POSTGRES_NAME} existe déjà"
 
-            echo "======================================"
-            echo " Application"
-            echo "======================================"
+                        RUNNING=$(docker inspect \
+                            -f '{{.State.Running}}' \
+                            "${POSTGRES_NAME}")
 
-            echo "🛑 Suppression ancienne application..."
-            docker rm -f prometric-app 2>/dev/null || true
+                        if [ "$RUNNING" != "true" ]; then
+                            echo "🚀 PostgreSQL arrêté → démarrage..."
+                            docker start "${POSTGRES_NAME}"
+                        else
+                            echo "✅ PostgreSQL déjà démarré"
+                        fi
 
-            echo "🚀 Démarrage nouvelle application..."
-            docker compose up -d --no-deps app
+                    else
 
-            echo "======================================"
-            echo " Vérification"
-            echo "======================================"
+                        echo "🚀 Container PostgreSQL absent"
+                        echo "Création avec Docker Compose..."
 
-            sleep 5
+                        docker compose up -d postgres
 
-            docker ps --filter name=prometric-postgres
-            docker ps --filter name=prometric-app
+                    fi
 
-            echo "======================================"
-            echo " Logs application"
-            echo "======================================"
+                    echo ""
+                    echo "⏳ Vérification PostgreSQL..."
 
-            docker logs --tail 50 prometric-app
+                    sleep 5
 
-            echo "✅ Déploiement terminé"
-        '''
+                    docker inspect \
+                        -f '{{.State.Status}}' \
+                        "${POSTGRES_NAME}"
+
+                    echo "✅ PostgreSQL disponible"
+                '''
+            }
+        }
+
+        stage('DEPLOY APP') {
+            steps {
+                sh '''
+                    set -e
+
+                    echo '======================================'
+                    echo ' Déploiement Application'
+                    echo '======================================'
+
+                    echo "🛑 Suppression ancienne application..."
+
+                    docker rm -f "${APP_NAME}" 2>/dev/null || true
+
+                    echo "🚀 Démarrage nouvelle application..."
+
+                    docker compose up -d --no-deps app
+
+                    echo "✅ Application démarrée"
+                '''
+            }
+        }
+
+        stage('HEALTH CHECK') {
+            steps {
+                sh '''
+                    set -e
+
+                    echo '======================================'
+                    echo ' Health Check'
+                    echo '======================================'
+
+                    echo "⏳ Attente du démarrage..."
+                    sleep 10
+
+                    echo ""
+                    echo "📦 Containers:"
+                    docker ps --filter "name=${APP_NAME}"
+                    docker ps --filter "name=${POSTGRES_NAME}"
+
+                    echo ""
+                    echo "🔎 État application:"
+
+                    STATUS=$(docker inspect \
+                        -f '{{.State.Status}}' \
+                        "${APP_NAME}")
+
+                    if [ "$STATUS" != "running" ]; then
+                        echo "❌ Application non démarrée"
+
+                        docker logs --tail 200 "${APP_NAME}" || true
+
+                        exit 1
+                    fi
+
+                    echo "✅ Application running"
+
+                    echo ""
+                    echo "❤️ Health API:"
+
+                    if docker exec "${APP_NAME}" \
+                        node -e "fetch('http://127.0.0.1:3000/api/health').then(r=>{console.log('HTTP '+r.status);process.exit(r.ok?0:1)}).catch(e=>{console.error(e);process.exit(1)})"
+                    then
+                        echo "✅ Health check OK"
+                    else
+                        echo "⚠️ Health endpoint indisponible"
+
+                        docker logs --tail 100 "${APP_NAME}" || true
+
+                        exit 1
+                    fi
+                '''
+            }
+        }
+
+        stage('CLEANUP') {
+            steps {
+                sh '''
+                    set -e
+
+                    echo '======================================'
+                    echo ' Docker Cleanup'
+                    echo '======================================'
+
+                    echo "🧹 Suppression des containers arrêtés..."
+                    docker container prune -f
+
+                    echo ""
+                    echo "🧹 Suppression des images inutilisées..."
+                    docker image prune -f
+
+                    echo ""
+                    echo "⚠️ PostgreSQL et son volume ne sont PAS supprimés"
+
+                    echo ""
+                    echo "📦 Containers actifs:"
+                    docker ps
+
+                    echo ""
+                    echo "💾 Volumes:"
+                    docker volume ls | grep prometric || true
+
+                    echo "✅ Nettoyage terminé"
+                '''
+            }
+        }
+    }
+
+    post {
+
+        success {
+            echo '''
+            ======================================
+            ✅ DEPLOYMENT SUCCESS
+            ======================================
+            '''
+        }
+
+        failure {
+            echo '''
+            ======================================
+            ❌ DEPLOYMENT FAILED
+            ======================================
+            '''
+
+            sh '''
+                echo "===== CONTAINERS ====="
+                docker ps -a || true
+
+                echo ""
+                echo "===== APP LOGS ====="
+                docker logs --tail 200 "${APP_NAME}" 2>/dev/null || true
+
+                echo ""
+                echo "===== POSTGRES LOGS ====="
+                docker logs --tail 100 "${POSTGRES_NAME}" 2>/dev/null || true
+            '''
+        }
+
+        always {
+            echo '📋 Pipeline terminé'
+        }
     }
 }
