@@ -1,0 +1,33 @@
+# Dockerfile for Jenkins Agent with Node.js 18 and build tools
+FROM node:18-bullseye
+
+# Install build essentials for native module compilation
+RUN apt-get update && \
+    apt-get install -y \
+    build-essential \
+    python3 \
+    python3-dev \
+    git \
+    curl \
+    wget \
+    && rm -rf /var/lib/apt/lists/*
+
+# Verify installations
+RUN node --version && \
+    npm --version && \
+    python3 --version && \
+    gcc --version
+
+# Set npm configuration
+RUN npm config set legacy-peer-deps true && \
+    npm config set optional false && \
+    npm cache clean --force
+
+# Create app directory
+WORKDIR /app
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD node --version
+
+CMD ["/bin/bash"]
