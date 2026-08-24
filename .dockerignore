@@ -1,0 +1,27 @@
+# Logs and caches
+node_modules
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# Git and OS metadata
+.git
+.gitignore
+.DS_Store
+Thumbs.db
+
+# Build outputs
+dist
+dist-ssr
+*.local
+
+# Environment files with secrets
+.env
+.env*.local
+
+# Temporary / editor files
+.vscode
+.idea
+*.swp
+*.swo

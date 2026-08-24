@@ -1,0 +1,6 @@
+{
+  "name": "Clarity PM",
+  "description": "Clarity PM : Plateforme de gestion de projet et portefeuille multi-projets avec suivi des performances, indicateurs personnalisables, vues Kanban, Gantt, matrice des risques et assistant IA.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

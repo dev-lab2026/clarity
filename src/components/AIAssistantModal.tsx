@@ -1,0 +1,6 @@
+import React from 'react';
+import { X, MessageCircle } from 'lucide-react';
+import { Project } from '../types';
+import { AssistantPMChat } from './AssistantPMChat';
+interface Props { project: Project; metrics?: any; onClose:()=>void; onAddTasksToProject?: (tasks:any[])=>void; onProjectUpdated?: (project:Project)=>void; }
+export const AIAssistantModal: React.FC<Props> = ({project,onClose,onProjectUpdated}) => <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4"><div className="bg-white rounded-3xl max-w-5xl w-full h-[92vh] shadow-2xl border border-slate-200 flex flex-col overflow-hidden"><div className="p-4 border-b bg-slate-900 text-white flex items-center justify-between"><div className="flex items-center gap-3"><MessageCircle className="w-5 h-5"/><div><h2 className="font-bold">Assistant PM</h2><p className="text-xs text-slate-300">Analyse IA du projet · {project.name}</p></div></div><button onClick={onClose} className="p-2 hover:bg-slate-800 rounded-lg"><X className="w-5 h-5"/></button></div><div className="p-4 flex-1 min-h-0 flex flex-col overflow-hidden"><AssistantPMChat project={project} onProjectUpdated={onProjectUpdated}/></div></div></div>;
