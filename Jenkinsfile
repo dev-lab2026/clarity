@@ -96,7 +96,7 @@ pipeline {
                     
                     echo ""
                     echo "Checking critical packages..."
-                    npm ls @vitejs/plugin-react @tailwindcss/vite vite react tailwindcss --depth=0
+                    npm ls @vitejs/plugin-react @tailwindcss/vite vite react tailwindcss --depth=0 || true
                     
                     echo ""
                     echo "Checking for rollup native bindings..."
@@ -111,6 +111,11 @@ pipeline {
             steps {
                 echo '🔨 Building application...'
                 sh '''
+                    echo "Current directory: $(pwd)"
+                    echo "Workspace contents:"
+                    ls -la | head -20
+                    
+                    echo ""
                     echo "Running build command..."
                     npm run build
                 '''
@@ -173,8 +178,8 @@ pipeline {
                         -H "Authorization: token ${GITHUB_CREDENTIALS_PSW}" \
                         -H "Accept: application/vnd.github.v3+json" \
                         https://api.github.com/repos/dev-lab2026/clarity/statuses/${COMMIT_SHA} \
-                        -d "{\"state\":\"success\",\"description\":\"Build succeeded\",\"context\":\"continuous-integration/jenkins\"}" \
-                        -w "\nHTTP Status: %{http_code}\n"
+                        -d '{"state":"success","description":"Build succeeded","context":"continuous-integration/jenkins"}' \
+                        -w "\\nHTTP Status: %{http_code}\\n"
                 '''
             }
         }
@@ -194,8 +199,8 @@ pipeline {
                         -H "Authorization: token ${GITHUB_CREDENTIALS_PSW}" \
                         -H "Accept: application/vnd.github.v3+json" \
                         https://api.github.com/repos/dev-lab2026/clarity/statuses/${COMMIT_SHA} \
-                        -d "{\"state\":\"failure\",\"description\":\"Build failed\",\"context\":\"continuous-integration/jenkins\"}" \
-                        -w "\nHTTP Status: %{http_code}\n" || true
+                        -d '{"state":"failure","description":"Build failed","context":"continuous-integration/jenkins"}' \
+                        -w "\\nHTTP Status: %{http_code}\\n" || true
                 fi
             '''
         }
