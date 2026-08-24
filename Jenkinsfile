@@ -48,17 +48,37 @@ pipeline {
             }
         }
         
+        stage('Clean Dependencies') {
+            steps {
+                echo '🧹 Cleaning npm cache and old dependencies...'
+                sh '''
+                    echo "Removing node_modules and package-lock.json..."
+                    rm -rf node_modules package-lock.json
+                    echo "Clearing npm cache..."
+                    npm cache clean --force
+                    echo "✓ Cache cleaned successfully"
+                '''
+            }
+        }
+        
         stage('Install Dependencies') {
             steps {
                 echo '📦 Installing dependencies...'
-                sh 'npm install'
+                sh '''
+                    echo "Installing npm packages..."
+                    npm install --verbose
+                    echo "✓ Dependencies installed successfully"
+                '''
             }
         }
         
         stage('Build') {
             steps {
                 echo '🔨 Building application...'
-                sh 'npm run build || true'
+                sh '''
+                    echo "Building with Vite..."
+                    npm run build
+                '''
             }
         }
         
@@ -86,6 +106,7 @@ pipeline {
                         echo "Copying out/ artifacts..."
                         cp -r out/* ${ARTIFACTS_DIR}/ || true
                     fi
+                    echo "✓ Artifacts archived successfully"
                 '''
                 archiveArtifacts artifacts: '**/*.js, **/*.css, **/*.html', allowEmptyArchive: true
             }
