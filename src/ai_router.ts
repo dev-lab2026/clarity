@@ -258,7 +258,25 @@ async function providerError(r: Response, provider: string) {
   return error;
 }
 
-async function callOpenAIStyle(baseUrl: string, apiKey: string, model: string, prompt: string, isJson: boolean, provider: AIProvider) {
+// L'analyse documentaire ("document"/"reasoning") renvoie un JSON riche
+// (analysis.elements + actions par tâche/jalon/risque détecté) qui dépasse
+// largement 8192 tokens dès que plusieurs documents ou un gros fichier sont
+// fournis. Une limite trop basse tronque le JSON en plein milieu et casse
+// tout le parsing (cleanCopilotJson bascule alors sur une réponse texte non
+// structurée : l'analyse "puissante" attendue par l'utilisateur est perdue).
+// Les tâches courtes/rapides gardent une limite basse pour rester réactives.
+function maxTokensForTask(task?: AIRouteTask): number {
+  switch (task) {
+    case 'document': return 32768;
+    case 'reasoning': return 24576;
+    case 'coding': return 16384;
+    case 'fast': return 4096;
+    case 'chat': return 8192;
+    default: return 16384;
+  }
+}
+
+async function callOpenAIStyle(baseUrl: string, apiKey: string, model: string, prompt: string, isJson: boolean, provider: AIProvider, maxTokens: number) {
   const r = await fetch(`${baseUrl.replace(/\/+$/, '')}/chat/completions`, {
     method: 'POST',
     headers: {
@@ -266,24 +284,41 @@ async function callOpenAIStyle(baseUrl: string, apiKey: string, model: string, p
       ...(provider === 'OPENROUTER' ? {'HTTP-Referer': process.env.APP_URL || 'https://clarity.ferjani.duckdns.org','X-Title':'CLARITY PM FREE AI Gateway'} : {})
     },
     body: JSON.stringify({
-      model, messages: [{ role: 'user', content: prompt }], temperature: 0.2, max_tokens: 8192,
+      model, messages: [{ role: 'user', content: prompt }], temperature: 0.2, max_tokens: maxTokens,
       ...(isJson ? { response_format: { type: 'json_object' } } : {})
     })
   });
   if (!r.ok) throw await providerError(r, provider);
   const d = await r.json() as any;
-  return String(d?.choices?.[0]?.message?.content || '');
+  const choice = d?.choices?.[0];
+  const text = String(choice?.message?.content || '');
+  // Un finish_reason "length" signifie que le modèle a été coupé avant la fin :
+  // le JSON renvoyé sera très probablement invalide. On le signale explicitement
+  // plutôt que de laisser cleanCopilotJson échouer silencieusement plus loin.
+  if (choice?.finish_reason === 'length') {
+    const err: any = new Error(`${provider}: réponse tronquée (max_tokens=${maxTokens} atteint) — réduisez le nombre de documents ou augmentez la limite.`);
+    err.truncated = true; err.partialText = text;
+    throw err;
+  }
+  return text;
 }
 
-async function callGemini(baseUrl: string, apiKey: string, model: string, prompt: string, isJson: boolean) {
-  const body: any = { contents: [{ parts: [{ text: prompt }] }], generationConfig: { temperature: 0.2, maxOutputTokens: 8192 } };
+async function callGemini(baseUrl: string, apiKey: string, model: string, prompt: string, isJson: boolean, maxTokens: number) {
+  const body: any = { contents: [{ parts: [{ text: prompt }] }], generationConfig: { temperature: 0.2, maxOutputTokens: maxTokens } };
   if (isJson) body.generationConfig.responseMimeType = 'application/json';
   const r = await fetch(`${baseUrl.replace(/\/+$/, '')}/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
   });
   if (!r.ok) throw await providerError(r, 'GEMINI');
   const d = await r.json() as any;
-  return String(d?.candidates?.[0]?.content?.parts?.map((x:any) => x.text || '').join('') || '');
+  const candidate = d?.candidates?.[0];
+  const text = String(candidate?.content?.parts?.map((x:any) => x.text || '').join('') || '');
+  if (candidate?.finishReason === 'MAX_TOKENS') {
+    const err: any = new Error(`GEMINI: réponse tronquée (maxOutputTokens=${maxTokens} atteint) — réduisez le nombre de documents ou augmentez la limite.`);
+    err.truncated = true; err.partialText = text;
+    throw err;
+  }
+  return text;
 }
 
 function isBillingExhausted(error: any) {
@@ -318,6 +353,7 @@ export async function routeAI(req: AIRouteRequest): Promise<AIRouteResult | null
   });
   if (!rows.length) throw new Error('Aucun provider IA GRATUIT disponible. Ajoutez Gemini, Groq, Mistral ou un modèle OpenRouter :free dans Administration → AI Provider Hub.');
 
+  const maxTokens = maxTokensForTask(task);
   let fallbackCount = 0;
   const errors: string[] = [];
   for (const row of rows) {
@@ -328,8 +364,21 @@ export async function routeAI(req: AIRouteRequest): Promise<AIRouteResult | null
       const model = req.model || row.model;
       if (!isFreeProvider(row.provider, model)) throw new Error(`Modèle non gratuit refusé: ${model}`);
       let text = '';
-      if (row.provider === 'GEMINI') text = await callGemini(row.base_url || PROVIDER_DEFAULTS.GEMINI.baseUrl, secret, model, req.prompt, !!req.isJson);
-      else text = await callOpenAIStyle(row.base_url || PROVIDER_DEFAULTS[row.provider as AIProvider].baseUrl, secret, model, req.prompt, !!req.isJson, row.provider);
+      try {
+        if (row.provider === 'GEMINI') text = await callGemini(row.base_url || PROVIDER_DEFAULTS.GEMINI.baseUrl, secret, model, req.prompt, !!req.isJson, maxTokens);
+        else text = await callOpenAIStyle(row.base_url || PROVIDER_DEFAULTS[row.provider as AIProvider].baseUrl, secret, model, req.prompt, !!req.isJson, row.provider, maxTokens);
+      } catch (truncErr: any) {
+        // Réponse coupée par la limite de tokens : on tente quand même d'exploiter
+        // le JSON partiel plutôt que de perdre toute l'analyse déjà produite par
+        // le modèle. repairTruncatedJson referme les tableaux/objets encore ouverts.
+        if (truncErr?.truncated && req.isJson && truncErr.partialText) {
+          const repaired = repairTruncatedJson(truncErr.partialText);
+          if (repaired) { text = repaired; }
+          else throw truncErr;
+        } else {
+          throw truncErr;
+        }
+      }
       if (!text.trim()) throw new Error('Réponse IA vide.');
       await p.query('UPDATE ai_provider_accounts SET last_error=NULL,last_used_at=NOW(),total_calls=total_calls+1,disabled_until=NULL,updated_at=NOW() WHERE id=$1', [row.id]);
       return { text, provider: row.provider, model, accountId: row.id, accountName: row.name, fallbackCount };
@@ -349,6 +398,42 @@ export async function routeAI(req: AIRouteRequest): Promise<AIRouteResult | null
     }
   }
   throw new Error(`Tous les providers IA GRATUITS ont échoué. ${errors.join(' | ')}`);
+}
+
+// Referme au mieux un JSON tronqué en fin de flux (chaîne ouverte, tableau ou
+// objet non fermé) afin de récupérer les éléments déjà générés par le modèle
+// plutôt que de jeter toute l'analyse documentaire. Retourne null si le
+// résultat n'est toujours pas un JSON valide.
+function repairTruncatedJson(partial: string): string | null {
+  let text = partial.trim();
+  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)\s*$/i);
+  if (fenced && text.startsWith('```')) text = fenced[1];
+  const start = text.indexOf('{');
+  if (start === -1) return null;
+  text = text.slice(start);
+
+  let inString = false, escape = false;
+  const stack: string[] = [];
+  let lastSafe = -1;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (inString) {
+      if (escape) escape = false;
+      else if (c === '\\') escape = true;
+      else if (c === '"') inString = false;
+      continue;
+    }
+    if (c === '"') { inString = true; continue; }
+    if (c === '{' || c === '[') stack.push(c);
+    else if (c === '}' || c === ']') stack.pop();
+    if (!inString && (stack.length === 0 || c === ',')) lastSafe = i;
+  }
+  // Coupe au dernier point où on n'était pas au milieu d'une valeur, pour
+  // éviter de refermer une chaîne ou un nombre tronqué en plein milieu.
+  if (lastSafe > -1 && lastSafe < text.length - 1) text = text.slice(0, lastSafe + 1).replace(/,\s*$/, '');
+  if (inString) text += '"';
+  for (let i = stack.length - 1; i >= 0; i--) text += stack[i] === '{' ? '}' : ']';
+  try { JSON.parse(text); return text; } catch { return null; }
 }
 
 export function getFreeProviderCatalog() {

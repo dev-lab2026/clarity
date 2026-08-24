@@ -755,13 +755,72 @@ Retourne STRICTEMENT ce JSON:
 }
 `;
 
+// Trouve la borne exacte du premier objet JSON complet en comptant les
+// accolades hors chaînes, au lieu d'un `\{[\s\S]*\}` gourmand qui peut
+// capturer du texte parasite après le JSON (ou s'arrêter sur une accolade
+// imbriquée si la réponse a été coupée) et faire échouer JSON.parse.
+function extractFirstJsonObject(text: string): string | null {
+  const start = text.indexOf('{');
+  if (start === -1) return null;
+  let depth = 0, inString = false, escape = false;
+  for (let i = start; i < text.length; i++) {
+    const c = text[i];
+    if (inString) {
+      if (escape) escape = false;
+      else if (c === '\\') escape = true;
+      else if (c === '"') inString = false;
+      continue;
+    }
+    if (c === '"') { inString = true; continue; }
+    if (c === '{') depth++;
+    else if (c === '}') { depth--; if (depth === 0) return text.slice(start, i + 1); }
+  }
+  return null; // objet jamais refermé : probablement tronqué
+}
+
 function cleanCopilotJson(text: string): any {
   const cleaned = cleanJsonResponse(text);
-  try { return JSON.parse(cleaned); } catch {
-    const match = cleaned.match(/\{[\s\S]*\}/);
-    if (match) return JSON.parse(match[0]);
-    throw new Error('La réponse du moteur Copilot n’est pas un JSON exploitable.');
+  try { return JSON.parse(cleaned); } catch { /* on essaie les stratégies suivantes */ }
+  const exact = extractFirstJsonObject(cleaned);
+  if (exact) {
+    try { return JSON.parse(exact); } catch { /* toujours invalide, on tente la réparation */ }
   }
+  // Réponse coupée en plein milieu (limite de tokens du moteur IA atteinte
+  // pendant une analyse documentaire volumineuse) : plutôt que de perdre
+  // tout le travail d'analyse, on referme au mieux les tableaux/objets
+  // encore ouverts pour récupérer ce qui a été généré jusque-là.
+  const repaired = repairTruncatedJson(cleaned);
+  if (repaired) return JSON.parse(repaired);
+  throw new Error('La réponse du moteur Copilot n’est pas un JSON exploitable.');
+}
+
+// Même logique de réparation que côté routeur IA (src/ai_router.ts), utilisée
+// ici en dernier recours quand le JSON reçu par le Copilot est tronqué.
+function repairTruncatedJson(partial: string): string | null {
+  let text = partial.trim();
+  const start = text.indexOf('{');
+  if (start === -1) return null;
+  text = text.slice(start);
+  let inString = false, escape = false;
+  const stack: string[] = [];
+  let lastSafe = -1;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (inString) {
+      if (escape) escape = false;
+      else if (c === '\\') escape = true;
+      else if (c === '"') inString = false;
+      continue;
+    }
+    if (c === '"') { inString = true; continue; }
+    if (c === '{' || c === '[') stack.push(c);
+    else if (c === '}' || c === ']') stack.pop();
+    if (!inString && (stack.length === 0 || c === ',')) lastSafe = i;
+  }
+  if (lastSafe > -1 && lastSafe < text.length - 1) text = text.slice(0, lastSafe + 1).replace(/,\s*$/, '');
+  if (inString) text += '"';
+  for (let i = stack.length - 1; i >= 0; i--) text += stack[i] === '{' ? '}' : ']';
+  try { JSON.parse(text); return text; } catch { return null; }
 }
 
 async function runCopilot(project: Project, files: Express.Multer.File[], message: string, user: MicrosoftSessionUser) {
