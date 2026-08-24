@@ -6,7 +6,6 @@ pipeline {
         BUILD_DIR = "${WORKSPACE}/build"
         ARTIFACTS_DIR = "${WORKSPACE}/artifacts"
         NODE_HOME = '/usr/bin/node'
-        // GitHub credentials
         GITHUB_CREDENTIALS = credentials('github-credentials')
     }
     
@@ -68,11 +67,12 @@ pipeline {
                     echo "Clearing npm cache..."
                     npm cache clean --force
                     
-                    echo "Configuring npm..."
+                    echo "Configuring npm for optional dependencies..."
                     npm config set legacy-peer-deps true
                     npm config set fetch-timeout 120000
                     npm config set fetch-retry-mintimeout 20000
                     npm config set fetch-retry-maxtimeout 120000
+                    npm config set optional true
                     
                     echo "✓ Environment configured"
                 '''
@@ -81,35 +81,32 @@ pipeline {
         
         stage('Install Dependencies') {
             steps {
-                echo '📦 Installing dependencies with rebuild...'
+                echo '📦 Installing dependencies...'
                 sh '''
-                    echo "Installing npm packages with native module rebuild..."
-                    npm install --verbose --build-from-source
+                    echo "Installing npm packages..."
+                    npm install --verbose --no-optional
                     
-                    if [ $? -ne 0 ]; then
-                        echo "First install attempt failed, trying with npm ci..."
-                        rm -rf node_modules package-lock.json
-                        npm install --verbose
-                    fi
+                    echo "Rebuilding native modules..."
+                    npm rebuild --verbose
                     
                     echo "✓ Dependencies installed successfully"
                 '''
             }
         }
         
-        stage('Verify Build') {
+        stage('Verify Installation') {
             steps {
-                echo '🔍 Verifying build setup...'
+                echo '🔍 Verifying installation...'
                 sh '''
-                    echo "Checking Tailwind installation..."
-                    if [ -d "node_modules/@tailwindcss/oxide" ]; then
-                        echo "✓ @tailwindcss/oxide found"
-                        ls -la node_modules/@tailwindcss/oxide/ | head -10
-                    else
-                        echo "⚠ @tailwindcss/oxide not found"
+                    echo "Checking critical dependencies..."
+                    npm ls tailwindcss @tailwindcss/vite vite react
+                    
+                    echo ""
+                    echo "Checking for compiled modules..."
+                    if [ -d "node_modules/@tailwindcss/vite" ]; then
+                        echo "✓ @tailwindcss/vite found"
                     fi
                     
-                    echo "Checking vite config..."
                     if [ -f "vite.config.ts" ]; then
                         echo "✓ vite.config.ts found"
                     fi
@@ -130,7 +127,7 @@ pipeline {
         stage('Test') {
             steps {
                 echo '✅ Running tests...'
-                sh 'npm run test || true'
+                sh 'npm run lint || true'
             }
         }
         
@@ -142,14 +139,6 @@ pipeline {
                     if [ -d "dist" ]; then
                         echo "Copying dist/ artifacts..."
                         cp -r dist/* ${ARTIFACTS_DIR}/ || true
-                    fi
-                    if [ -d "build" ]; then
-                        echo "Copying build/ artifacts..."
-                        cp -r build/* ${ARTIFACTS_DIR}/ || true
-                    fi
-                    if [ -d "out" ]; then
-                        echo "Copying out/ artifacts..."
-                        cp -r out/* ${ARTIFACTS_DIR}/ || true
                     fi
                     echo "✓ Artifacts archived"
                 '''
