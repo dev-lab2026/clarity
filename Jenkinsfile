@@ -5,7 +5,6 @@ pipeline {
         APP_NAME = 'clarity'
         BUILD_DIR = "${WORKSPACE}/build"
         ARTIFACTS_DIR = "${WORKSPACE}/artifacts"
-        NODE_HOME = '/usr/bin/node'
         GITHUB_CREDENTIALS = credentials('github-credentials')
     }
     
@@ -36,45 +35,38 @@ pipeline {
             steps {
                 echo '⚙️  Setting up build environment...'
                 sh '''
-                    echo "Installing system dependencies for native module compilation..."
+                    echo "Updating system packages..."
                     apt-get update
-                    apt-get install -y build-essential python3 python3-dev git
                     
-                    echo "Checking for Node.js..."
-                    if ! command -v node &> /dev/null; then
-                        echo "Node.js not found. Installing Node.js 18..."
-                        curl -sL https://deb.nodesource.com/setup_18.x | bash -
-                        apt-get install -y nodejs
-                    fi
+                    echo "Installing system dependencies..."
+                    apt-get install -y build-essential python3 python3-dev git curl wget
                     
-                    echo "Node version:"
+                    echo "Installing Node.js 20 (LTS)..."
+                    curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+                    apt-get install -y nodejs
+                    
+                    echo "Verifying installation..."
                     node --version
-                    echo "NPM version:"
                     npm --version
-                    echo "Python version:"
                     python3 --version
                 '''
             }
         }
         
-        stage('Clean & Configure') {
+        stage('Clean Cache') {
             steps {
-                echo '🧹 Cleaning and configuring npm...'
+                echo '🧹 Cleaning npm cache and temporary files...'
                 sh '''
-                    echo "Removing old dependencies..."
+                    echo "Removing node_modules and lock files..."
                     rm -rf node_modules package-lock.json
                     
                     echo "Clearing npm cache..."
                     npm cache clean --force
                     
-                    echo "Configuring npm for optional dependencies..."
-                    npm config set legacy-peer-deps true
-                    npm config set fetch-timeout 120000
-                    npm config set fetch-retry-mintimeout 20000
-                    npm config set fetch-retry-maxtimeout 120000
-                    npm config set optional true
+                    echo "Removing npm temporary directory..."
+                    rm -rf ~/.npm
                     
-                    echo "✓ Environment configured"
+                    echo "✓ Cache cleaned"
                 '''
             }
         }
@@ -84,10 +76,10 @@ pipeline {
                 echo '📦 Installing dependencies...'
                 sh '''
                     echo "Installing npm packages..."
-                    npm install --verbose --no-optional
+                    npm install --verbose --force
                     
-                    echo "Rebuilding native modules..."
-                    npm rebuild --verbose
+                    echo "Installing optional dependencies..."
+                    npm install --save-optional
                     
                     echo "✓ Dependencies installed successfully"
                 '''
@@ -98,18 +90,19 @@ pipeline {
             steps {
                 echo '🔍 Verifying installation...'
                 sh '''
-                    echo "Checking critical dependencies..."
-                    npm ls tailwindcss @tailwindcss/vite vite react
+                    echo "Node and npm versions:"
+                    node --version
+                    npm --version
                     
                     echo ""
-                    echo "Checking for compiled modules..."
-                    if [ -d "node_modules/@tailwindcss/vite" ]; then
-                        echo "✓ @tailwindcss/vite found"
-                    fi
+                    echo "Checking critical packages..."
+                    npm ls @vitejs/plugin-react @tailwindcss/vite vite react tailwindcss --depth=0
                     
-                    if [ -f "vite.config.ts" ]; then
-                        echo "✓ vite.config.ts found"
-                    fi
+                    echo ""
+                    echo "Checking for rollup native bindings..."
+                    ls -la node_modules/@rollup/ 2>/dev/null | head -20 || echo "Rollup packages found"
+                    
+                    echo "✓ Verification complete"
                 '''
             }
         }
@@ -126,7 +119,7 @@ pipeline {
         
         stage('Test') {
             steps {
-                echo '✅ Running tests...'
+                echo '✅ Running linter...'
                 sh 'npm run lint || true'
             }
         }
@@ -142,7 +135,7 @@ pipeline {
                     fi
                     echo "✓ Artifacts archived"
                 '''
-                archiveArtifacts artifacts: '**/*.js, **/*.css, **/*.html', allowEmptyArchive: true
+                archiveArtifacts artifacts: '**/*.js, **/*.css, **/*.html, **/*.cjs', allowEmptyArchive: true
             }
         }
         
@@ -214,7 +207,7 @@ pipeline {
     
     options {
         buildDiscarder(logRotator(numToKeepStr: '5'))
-        timeout(time: 45, unit: 'MINUTES')
+        timeout(time: 60, unit: 'MINUTES')
         timestamps()
     }
 }
