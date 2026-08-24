@@ -32,7 +32,7 @@ pipeline {
 
         stage('2 - Checkout GitHub') {
             steps {
-                echo '📥 Clonage de Clarity depuis GitHub...'
+                echo '📥 Clonage du repository GitHub...'
 
                 checkout([
                     $class: 'GitSCM',
@@ -50,6 +50,9 @@ pipeline {
                     pwd
                     ls -la
 
+                    echo ""
+                    echo "🔎 Vérification des fichiers..."
+
                     test -f Dockerfile || {
                         echo "❌ Dockerfile introuvable"
                         exit 1
@@ -65,17 +68,33 @@ pipeline {
                         exit 1
                     }
 
-                    test -f package-lock.json || {
-                        echo "❌ package-lock.json introuvable"
+                    test -f bun.lock || {
+                        echo "❌ bun.lock introuvable"
                         exit 1
                     }
 
-                    echo "✅ Fichiers nécessaires présents"
+                    test -f docker-entrypoint.cjs || {
+                        echo "❌ docker-entrypoint.cjs introuvable"
+                        exit 1
+                    }
+
+                    test -f server.ts || {
+                        echo "❌ server.ts introuvable"
+                        exit 1
+                    }
+
+                    test -f .env || {
+                        echo "❌ .env introuvable"
+                        exit 1
+                    }
+
+                    echo ""
+                    echo "✅ Tous les fichiers nécessaires sont présents"
                 '''
             }
         }
 
-        stage('3 - Check Docker') {
+        stage('3 - Docker Check') {
             steps {
                 sh '''
                     set -e
@@ -83,7 +102,8 @@ pipeline {
                     echo "🐳 Docker:"
                     docker --version
 
-                    echo "🐳 Compose:"
+                    echo ""
+                    echo "🐳 Docker Compose:"
                     docker compose version
 
                     echo ""
@@ -105,7 +125,7 @@ pipeline {
                         echo "✅ shared_network existe"
                     else
                         echo "⚠️ shared_network absent"
-                        echo "Création..."
+                        echo "Création de shared_network..."
 
                         docker network create shared_network
                     fi
@@ -120,61 +140,65 @@ pipeline {
 
                     echo "🔍 Validation docker-compose.yml..."
 
-                    docker compose config
+                    docker compose config >/tmp/prometric-compose.yml
 
-                    echo "✅ Compose valide"
+                    echo "✅ docker-compose.yml valide"
                 '''
             }
         }
 
-        stage('6 - Build Docker') {
+        stage('6 - Build Docker Image') {
             steps {
-                echo '🔨 Construction de l’image Clarity...'
+                echo '🔨 Construction de l’image Docker...'
 
                 sh '''
                     set -e
 
-                    echo "🐳 Build Docker..."
+                    echo "🐳 Build de ${APP_IMAGE}..."
 
-                    docker compose build --pull
+                    docker compose build --pull app
 
                     echo ""
-                    echo "✅ Build terminé"
+                    echo "✅ Image Docker construite"
 
-                    docker images \
-                        --format 'table {{.Repository}}\\t{{.Tag}}\\t{{.ID}}\\t{{.CreatedSince}}' \
-                        | grep -E 'prometric|REPOSITORY' || true
+                    docker image inspect "${APP_IMAGE}" >/dev/null
+
+                    echo "✅ Image vérifiée"
                 '''
             }
         }
 
         stage('7 - Start PostgreSQL') {
             steps {
-                echo '🐘 Vérification PostgreSQL...'
+                echo '🐘 Démarrage / vérification PostgreSQL...'
 
                 sh '''
                     set -e
 
                     docker compose up -d postgres
 
-                    echo "⏳ Attente PostgreSQL..."
+                    echo "⏳ Attente de PostgreSQL..."
 
                     for i in $(seq 1 30); do
 
                         STATUS=$(docker inspect \
                             --format='{{.State.Health.Status}}' \
-                            ${POSTGRES_CONTAINER} 2>/dev/null || echo "starting")
+                            "${POSTGRES_CONTAINER}" \
+                            2>/dev/null || echo "starting")
 
-                        echo "PostgreSQL: $STATUS"
+                        echo "PostgreSQL status: ${STATUS}"
 
-                        if [ "$STATUS" = "healthy" ]; then
+                        if [ "${STATUS}" = "healthy" ]; then
                             echo "✅ PostgreSQL healthy"
                             break
                         fi
 
-                        if [ "$i" -eq 30 ]; then
-                            echo "❌ PostgreSQL n'est pas healthy"
-                            docker logs --tail 150 ${POSTGRES_CONTAINER} || true
+                        if [ "${i}" -eq 30 ]; then
+                            echo "❌ PostgreSQL ne devient pas healthy"
+
+                            docker logs --tail 150 \
+                                "${POSTGRES_CONTAINER}" || true
+
                             exit 1
                         fi
 
@@ -184,22 +208,22 @@ pipeline {
             }
         }
 
-        stage('8 - Replace Application') {
+        stage('8 - Deploy Application') {
             steps {
-                echo '🚀 Déploiement de la nouvelle application...'
+                echo '🚀 Déploiement de la nouvelle version...'
 
                 sh '''
                     set -e
 
-                    echo "🛑 Arrêt de l'ancien conteneur..."
+                    echo "🛑 Arrêt de l'ancienne application..."
 
                     docker compose stop app 2>/dev/null || true
 
                     echo "🗑️ Suppression de l'ancien conteneur..."
 
-                    docker rm -f ${APP_CONTAINER} 2>/dev/null || true
+                    docker rm -f "${APP_CONTAINER}" 2>/dev/null || true
 
-                    echo "🚀 Démarrage de la nouvelle version..."
+                    echo "🚀 Démarrage de la nouvelle application..."
 
                     docker compose up -d app
 
@@ -208,32 +232,34 @@ pipeline {
             }
         }
 
-        stage('9 - Application Health Check') {
+        stage('9 - Health Check') {
             steps {
-                echo '🔍 Vérification de l’application...'
+                echo '🔍 Vérification de Clarity...'
 
                 sh '''
                     set -e
 
-                    echo "⏳ Attente du healthcheck..."
+                    echo "⏳ Attente du healthcheck Docker..."
 
                     for i in $(seq 1 30); do
 
                         STATUS=$(docker inspect \
                             --format='{{.State.Health.Status}}' \
-                            ${APP_CONTAINER} 2>/dev/null || echo "starting")
+                            "${APP_CONTAINER}" \
+                            2>/dev/null || echo "starting")
 
-                        echo "Application: $STATUS"
+                        echo "Application status: ${STATUS}"
 
-                        if [ "$STATUS" = "healthy" ]; then
+                        if [ "${STATUS}" = "healthy" ]; then
                             echo "✅ Application healthy"
                             break
                         fi
 
-                        if [ "$i" -eq 30 ]; then
+                        if [ "${i}" -eq 30 ]; then
                             echo "❌ Application non healthy"
 
-                            docker logs --tail 200 ${APP_CONTAINER} || true
+                            docker logs --tail 200 \
+                                "${APP_CONTAINER}" || true
 
                             exit 1
                         fi
@@ -242,35 +268,39 @@ pipeline {
                     done
 
                     echo ""
-                    echo "🌐 Test API /api/health..."
+                    echo "🌐 Test HTTP /api/health..."
 
-                    curl --fail --silent --show-error \
-                        http://127.0.0.1:3000/api/health
+                    curl --fail \
+                         --silent \
+                         --show-error \
+                         http://127.0.0.1:3000/api/health
 
                     echo ""
-                    echo "✅ /api/health OK"
+                    echo "✅ API /api/health OK"
                 '''
             }
         }
 
         stage('10 - Cleanup Old Docker Images') {
             steps {
-                echo '🧹 Nettoyage des anciennes images...'
+                echo '🧹 Nettoyage des anciennes images inutilisées...'
 
                 sh '''
                     set -e
 
                     echo "Images avant nettoyage:"
-                    docker images
+                    docker images \
+                        --format 'table {{.Repository}}\\t{{.Tag}}\\t{{.ID}}\\t{{.CreatedSince}}'
 
                     echo ""
-                    echo "🧹 Suppression des images dangling..."
+                    echo "🧹 Suppression uniquement des images dangling..."
 
                     docker image prune -f
 
                     echo ""
                     echo "Images après nettoyage:"
-                    docker images
+                    docker images \
+                        --format 'table {{.Repository}}\\t{{.Tag}}\\t{{.ID}}\\t{{.CreatedSince}}'
                 '''
             }
         }
@@ -278,8 +308,9 @@ pipeline {
         stage('11 - Final Verification') {
             steps {
                 sh '''
+                    echo ""
                     echo "=========================================="
-                    echo "       CLARITY DEPLOYMENT"
+                    echo "       PROMETRIC / CLARITY"
                     echo "=========================================="
 
                     echo ""
@@ -289,13 +320,18 @@ pipeline {
 
                     echo ""
                     echo "🐳 Application image:"
-                    docker image inspect ${APP_IMAGE} \
+                    docker image inspect "${APP_IMAGE}" \
                         --format '{{.RepoTags}} - {{.Id}}' || true
 
                     echo ""
                     echo "🐘 PostgreSQL volume:"
                     docker volume inspect prometric-postgres-data \
                         --format '{{.Name}}' || true
+
+                    echo ""
+                    echo "🌐 Network:"
+                    docker network inspect shared_network \
+                        --format '{{range .Containers}}{{.Name}} {{end}}' || true
 
                     echo ""
                     echo "=========================================="
@@ -317,21 +353,25 @@ pipeline {
 
             sh '''
                 echo ""
-                echo "===== CONTAINERS ====="
+                echo "========== CONTAINERS =========="
 
                 docker ps -a \
                     --format 'table {{.Names}}\\t{{.Image}}\\t{{.Status}}\\t{{.Ports}}' \
                     || true
 
                 echo ""
-                echo "===== PROMETRIC APP LOGS ====="
+                echo "========== APPLICATION LOGS =========="
 
-                docker logs --tail 200 ${APP_CONTAINER} 2>/dev/null || true
+                docker logs --tail 200 \
+                    "${APP_CONTAINER}" \
+                    2>/dev/null || true
 
                 echo ""
-                echo "===== POSTGRES LOGS ====="
+                echo "========== POSTGRES LOGS =========="
 
-                docker logs --tail 100 ${POSTGRES_CONTAINER} 2>/dev/null || true
+                docker logs --tail 100 \
+                    "${POSTGRES_CONTAINER}" \
+                    2>/dev/null || true
             '''
         }
 
