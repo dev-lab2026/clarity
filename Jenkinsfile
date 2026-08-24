@@ -111,13 +111,30 @@ pipeline {
             steps {
                 echo '🔨 Building application...'
                 sh '''
+                    set -x
                     echo "Current directory: $(pwd)"
                     echo "Workspace contents:"
                     ls -la | head -20
                     
                     echo ""
-                    echo "Running build command..."
-                    npm run build
+                    echo "Checking vite.config.ts:"
+                    [ -f "vite.config.ts" ] && echo "✓ vite.config.ts exists" || echo "✗ vite.config.ts missing"
+                    
+                    echo ""
+                    echo "Checking package.json build script:"
+                    cat package.json | grep -A 2 '"build"'
+                    
+                    echo ""
+                    echo "Running npm run build..."
+                    npm run build 2>&1
+                    BUILD_EXIT=$?
+                    echo "Build exit code: $BUILD_EXIT"
+                    
+                    if [ $BUILD_EXIT -ne 0 ]; then
+                        echo "✗ Build failed with exit code $BUILD_EXIT"
+                        exit $BUILD_EXIT
+                    fi
+                    echo "✓ Build completed successfully"
                 '''
             }
         }
