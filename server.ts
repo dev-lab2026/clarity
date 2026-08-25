@@ -216,6 +216,7 @@ IMPORTANT: tu ne modifies jamais CLARITY directement. Tu proposes des actions CR
 
 Réponds STRICTEMENT en JSON: {"reply":"...","analysis":{"summary":"...","findings":[],"contradictions":[],"recommendations":[],"elements":{"tasks":[],"milestones":[],"risks":[],"dates":[],"budgets":[],"decisions":[],"corrections":[],"missing":[]}},"actions":[]}.
 Actions autorisées: update_project {patch}, add_task {task}, update_task {id,patch}, add_milestone {milestone}, update_milestone {id,patch}, add_risk {risk}, update_risk {id,patch}. Ne supprime jamais. Pour CHAQUE action, retourne un objet JSON complet avec type, id si modification d'un élément existant, patch/task/milestone/risk, reason, source et targetProjectId égal à l'identifiant exact du projet fourni. Pour une création, ne fabrique pas d'id de tâche/jalon/risque: CLARITY le générera. Pour rattacher une tâche à un jalon créé dans la même réponse, utilise task.milestoneProposalId égal au proposalId du add_milestone correspondant; pour un jalon existant, utilise task.milestoneId exact ou milestoneTitle. Ne crée jamais une action destinée à un autre projet. Le JSON doit être directement exploitable par le backend, sans markdown.
+`;
 
 function normalizeCopilotAction(raw:any, project:Project, index:number){
   const type=String(raw?.type||'').trim().toLowerCase();
