@@ -203,10 +203,7 @@ async function extractDocumentEvidenceForCopilot(files: Express.Multer.File[]) {
   }
   const joined = sections.join('\n\n');
   // We only extract the bytes into text here; no local semantic analysis is performed.
-  const MAX_EVIDENCE_CHARS = 70000;
-  return joined.length > MAX_EVIDENCE_CHARS
-    ? `${joined.slice(0, MAX_EVIDENCE_CHARS)}\n[Contenu tronqué par CLARITY à ${MAX_EVIDENCE_CHARS} caractères pour accélérer l'analyse; les premières sections/lignes sont conservées.]`
-    : joined;
+  return joined.length > 180000 ? `${joined.slice(0, 180000)}\n[Contenu tronqué par CLARITY pour respecter la taille de la requête; les premières feuilles/lignes sont conservées.]` : joined;
 }
 
 const M365_COPILOT_SYSTEM_PROMPT = `Tu es Microsoft 365 Copilot utilisé comme moteur IA du Copilot Projet de CLARITY PM.
@@ -218,7 +215,8 @@ RÈGLES: analyse toutes les feuilles/sections/lignes pertinentes; cite les preuv
 IMPORTANT: tu ne modifies jamais CLARITY directement. Tu proposes des actions CRUD qui seront montrées à l'utilisateur puis appliquées uniquement après confirmation explicite.
 
 Réponds STRICTEMENT en JSON: {"reply":"...","analysis":{"summary":"...","findings":[],"contradictions":[],"recommendations":[],"elements":{"tasks":[],"milestones":[],"risks":[],"dates":[],"budgets":[],"decisions":[],"corrections":[],"missing":[]}},"actions":[]}.
-Actions autorisées: update_project {patch}, add_task {task}, update_task {id,patch}, add_milestone {milestone}, update_milestone {id,patch}, add_risk {risk}, update_risk {id,patch}. Ne supprime jamais. Pour CHAQUE action, retourne un objet JSON complet avec type, id si modification d'un élément existant, patch/task/milestone/risk, reason, source et targetProjectId égal à l'identifiant exact du projet fourni. Pour une création, ne fabrique pas d'id de tâche/jalon/risque: CLARITY le générera. Pour rattacher une tâche à un jalon créé dans la même réponse, utilise task.milestoneProposalId égal au proposalId du add_milestone correspondant; pour un jalon existant, utilise task.milestoneId exact ou milestoneTitle. Ne crée jamais une action destinée à un autre projet. Le JSON doit être directement exploitable par le backend, sans markdown.`;
+Actions autorisées: update_project {patch}, add_task {task}, update_task {id,patch}, add_milestone {milestone}, update_milestone {id,patch}, add_risk {risk}, update_risk {id,patch}. Ne supprime jamais. Pour CHAQUE action, retourne un objet JSON complet avec type, id si modification d'un élément existant, patch/task/milestone/risk, reason, source et targetProjectId égal à l'identifiant exact du projet fourni. Pour une création, ne fabrique pas d'id de tâche/jalon/risque: CLARITY le générera. Pour rattacher une tâche à un jalon créé dans la même réponse, utilise task.milestoneProposalId égal au proposalId du add_milestone correspondant; pour un jalon existant, utilise task.milestoneId exact ou milestoneTitle. Ne crée jamais une action destinée à un autre projet. Le JSON doit être directement exploitable par le backend, sans markdown.
+`;
 
 function normalizeCopilotAction(raw:any, project:Project, index:number){
   const type=String(raw?.type||'').trim().toLowerCase();
@@ -248,184 +246,123 @@ function copilotActionKey(a:any, index=0){
   return String(a?.proposalId || a?._key || `legacy-${String(a?.type||'action')}-${String(a?.id||index)}`);
 }
 
-function canonicalClarityProjectUpdate(project: Project, actions: any[], files: any[] = []) {
-  const operations:any[] = [];
-  const projectFields=['name','code','description','client','managerName','managerId','status','priority','methodology','startDate','endDate','totalBudget','currency'];
-  const taskFields=['title','description','status','priority','assigneeId','milestoneId','startDate','dueDate','estimatedHours','actualHours','completionPercent','costEstimated','costActual','category','tags','subtasks','predecessorIds'];
-  const milestoneFields=['title','targetDate','actualDate','completed','description','deliverable','deliverables'];
-  const riskFields=['title','description','category','probability','impact','mitigationPlan','contingencyPlan','ownerId','financialImpact','status','identifiedDate'];
-  const pick=(obj:any, fields:string[])=>Object.fromEntries(fields.filter(k=>obj?.[k]!==undefined).map(k=>[k,obj[k]]));
-  const date=(v:any, fallback:string)=>normalizeDate(v)||fallback;
-  for(const a of Array.isArray(actions)?actions:[]) {
-    const type=String(a?.type||'').toLowerCase();
-    const source=a?.source||a?.reason||'Copilot';
-    if(type==='update_project') {
-      const patch=pick(a.patch,projectFields);
-      if(Object.keys(patch).length) operations.push({op:'update',entity:'project',id:String(project.id),patch,reason:String(a.reason||''),source});
-    } else if(type==='update_task') {
-      const id=String(a.targetId||a.id||'');
-      if(project.tasks.some(t=>String(t.id)===id)) {
-        const patch=pick(a.patch,taskFields);
-        if(Object.keys(patch).length) operations.push({op:'update',entity:'task',id,patch,reason:String(a.reason||''),source});
-      }
-    } else if(type==='add_task') {
-      const t=a.task||{};
-      operations.push({op:'create',entity:'task',id:null,data:{
-        projectId:String(project.id),title:String(t.title||'Tâche IA'),description:String(t.description||''),
-        status:['TODO','IN_PROGRESS','REVIEW','DONE','BLOCKED'].includes(t.status)?t.status:'TODO',
-        priority:['LOW','MEDIUM','HIGH','CRITICAL'].includes(t.priority)?t.priority:'MEDIUM',
-        assigneeId:t.assigneeId||undefined,milestoneId:t.milestoneId||undefined,milestoneProposalId:t.milestoneProposalId||undefined,
-        startDate:date(t.startDate,project.startDate),dueDate:date(t.dueDate,project.endDate),estimatedHours:Number(t.estimatedHours)||0,
-        actualHours:Number(t.actualHours)||0,completionPercent:Math.max(0,Math.min(100,Number(t.completionPercent)||0)),costEstimated:Number(t.costEstimated)||0,costActual:Number(t.costActual)||0,
-        category:String(t.category||'DOCUMENT-IA'),tags:Array.isArray(t.tags)?t.tags.map(String):['DOCUMENT-IA'],subtasks:Array.isArray(t.subtasks)?t.subtasks:[],predecessorIds:Array.isArray(t.predecessorIds)?t.predecessorIds.map(String):[]
-      },reason:String(a.reason||''),source});
-    } else if(type==='update_milestone') {
-      const id=String(a.targetId||a.id||'');
-      if(project.milestones.some(m=>String(m.id)===id)) {
-        const patch=pick(a.patch,milestoneFields); if(Object.keys(patch).length) operations.push({op:'update',entity:'milestone',id,patch,reason:String(a.reason||''),source});
-      }
-    } else if(type==='add_milestone') {
-      const m=a.milestone||{};
-      operations.push({op:'create',entity:'milestone',id:null,data:{projectId:String(project.id),title:String(m.title||'Jalon IA'),targetDate:date(m.targetDate,project.endDate),actualDate:m.actualDate?date(m.actualDate,project.endDate):undefined,completed:Boolean(m.completed),description:String(m.description||''),deliverable:String(m.deliverable||''),deliverables:Array.isArray(m.deliverables)?m.deliverables.map(String):undefined},reason:String(a.reason||''),source});
-    } else if(type==='update_risk') {
-      const id=String(a.targetId||a.id||'');
-      if(project.risks.some(r=>String(r.id)===id)) {
-        const patch=pick(a.patch,riskFields); if(Object.keys(patch).length) operations.push({op:'update',entity:'risk',id,patch,reason:String(a.reason||''),source});
-      }
-    } else if(type==='add_risk') {
-      const r=a.risk||{};
-      operations.push({op:'create',entity:'risk',id:null,data:{projectId:String(project.id),title:String(r.title||'Risque IA'),description:String(r.description||''),category:['TECHNIQUE','BUDGET','DELAIS','RESSOURCES','JURIDIQUE','EXTERNE'].includes(r.category)?r.category:'TECHNIQUE',probability:Math.max(1,Math.min(5,Number(r.probability)||3)),impact:Math.max(1,Math.min(5,Number(r.impact)||3)),mitigationPlan:String(r.mitigationPlan||''),contingencyPlan:String(r.contingencyPlan||''),ownerId:r.ownerId||undefined,financialImpact:r.financialImpact!==undefined?Number(r.financialImpact):undefined,status:['ACTIVE','MITIGATED','CLOSED','OCCURRED'].includes(r.status)?r.status:'ACTIVE',identifiedDate:date(r.identifiedDate,new Date().toISOString().slice(0,10))},reason:String(a.reason||''),source});
-    }
+async function getCopilotStudioDirectLineToken() {
+  const secret = String(process.env.COPILOT_DIRECTLINE_SECRET || '').trim();
+  if (!secret) throw new Error('COPILOT_DIRECTLINE_SECRET n’est pas configuré. Copilot Studio → Settings → Security → Web channel security → Secret 1.');
+  const response = await fetch('https://directline.botframework.com/v3/directline/tokens/generate', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${secret}` },
+  });
+  const text = await response.text();
+  let data:any = {};
+  try { data = text ? JSON.parse(text) : {}; } catch { data = { raw:text }; }
+  if (!response.ok || !data?.token || !data?.conversationId) {
+    throw new Error(`Copilot Studio Direct Line token impossible (${response.status}): ${String(data?.error?.message || data?.message || text || 'réponse vide').slice(0,800)}`);
   }
-  return {
-    schema:'clarity.pm.project-update.v1', version:1, mode:'proposal',
-    generatedAt:new Date().toISOString(), project:{id:String(project.id),code:String(project.code||''),name:String(project.name||'')},
-    sourceFiles:(files||[]).map((f:any)=>({name:String(f.name||''),type:f.type||undefined,size:f.size||undefined})),
-    operations
-  };
+  return { token:String(data.token), conversationId:String(data.conversationId), expiresIn:Number(data.expires_in||1800) };
 }
 
-function compactCopilotProject(project: Project) {
-  const tasks = (project.tasks || []).map((t:any) => ({
-    id:t.id, title:t.title, description:t.description, status:t.status, priority:t.priority,
-    assigneeId:t.assigneeId, startDate:t.startDate, dueDate:t.dueDate,
-    estimatedHours:t.estimatedHours, actualHours:t.actualHours, completionPercent:t.completionPercent,
-    costEstimated:t.costEstimated, costActual:t.costActual, milestoneId:t.milestoneId
-  }));
-  const milestones = (project.milestones || []).map((m:any) => ({
-    id:m.id, title:m.title, targetDate:m.targetDate, completed:m.completed,
-    description:m.description, deliverable:m.deliverable
-  }));
-  const risks = (project.risks || []).map((r:any) => ({
-    id:r.id, title:r.title, description:r.description, category:r.category,
-    probability:r.probability, impact:r.impact, mitigationPlan:r.mitigationPlan,
-    contingencyPlan:r.contingencyPlan, status:r.status, identifiedDate:r.identifiedDate
-  }));
-  return {
-    id:project.id, code:project.code, name:project.name, description:project.description,
-    client:project.client, status:project.status, priority:project.priority,
-    startDate:project.startDate, endDate:project.endDate, budget:project.budget,
-    totalBudget:project.totalBudget, currency:project.currency, tasks, milestones, risks
-  };
+async function sendCopilotStudioActivity(token:string, conversationId:string, text:string, user:MicrosoftSessionUser) {
+  const response = await fetch(`https://directline.botframework.com/v3/directline/conversations/${encodeURIComponent(conversationId)}/activities`, {
+    method:'POST',
+    headers:{ Authorization:`Bearer ${token}`, 'Content-Type':'application/json' },
+    body:JSON.stringify({
+      type:'message',
+      locale:'fr-FR',
+      from:{ id:`clarity-${String(user.id).replace(/[^a-zA-Z0-9_-]/g,'_')}`, name:user.displayName },
+      text,
+    }),
+  });
+  const body=await response.text();
+  if(!response.ok) throw new Error(`Copilot Studio Direct Line: envoi impossible (${response.status}) ${body.slice(0,800)}`);
+  return body ? JSON.parse(body) : {};
 }
 
-function trimCopilotText(value:any, max=5000) {
-  const s=String(value||'');
-  return s.length>max ? `${s.slice(0,max)}…` : s;
+async function waitForCopilotStudioReply(token:string, conversationId:string, sentActivityId?:string) {
+  const started=Date.now();
+  let watermark='';
+  const timeoutMs=Math.max(15000,Number(process.env.COPILOT_DIRECTLINE_TIMEOUT_MS||90000));
+  while(Date.now()-started < timeoutMs) {
+    const url=`https://directline.botframework.com/v3/directline/conversations/${encodeURIComponent(conversationId)}/activities${watermark?`?watermark=${encodeURIComponent(watermark)}`:''}`;
+    const response=await fetch(url,{headers:{Authorization:`Bearer ${token}`}});
+    const body=await response.text();
+    if(!response.ok) throw new Error(`Copilot Studio Direct Line: lecture impossible (${response.status}) ${body.slice(0,800)}`);
+    let data:any={}; try{data=body?JSON.parse(body):{};}catch{}
+    watermark=String(data?.watermark||watermark);
+    const activities=Array.isArray(data?.activities)?data.activities:[];
+    const candidates=activities.filter((a:any)=>a?.type==='message' && a?.from?.id && String(a.from.id)!=='' && (!sentActivityId || String(a.id)!==String(sentActivityId)));
+    const botMessages=candidates.filter((a:any)=>!String(a.from.id).startsWith('clarity-'));
+    const reply=botMessages.slice().reverse().find((a:any)=>String(a.text||'').trim());
+    if(reply?.text) return {text:String(reply.text), activity:reply};
+    await new Promise(r=>setTimeout(r,700));
+  }
+  throw new Error(`Copilot Studio n’a pas répondu dans le délai de ${Math.round(timeoutMs/1000)} secondes.`);
 }
 
-async function runGatewayCopilot(project: Project, files: Express.Multer.File[], message: string, user: MicrosoftSessionUser) {
-  const memory = await loadCopilotMemory(project.id, user.id);
-  const effectiveMessage = message || (files.length
-    ? 'Analyse les fichiers joints, compare-les au projet et identifie précisément les écarts et corrections utiles.'
-    : 'Réponds à ma demande avec le contexte déjà mémorisé.');
+async function runCopilotStudio(project: Project, files: Express.Multer.File[], message: string, user: MicrosoftSessionUser) {
+  const memory=await loadCopilotMemory(project.id,user.id);
+  const evidence=files.length ? await extractDocumentEvidenceForCopilot(files) : String(memory.evidence||'');
+  const effectiveMessage=message || (files.length
+    ? 'Analyse en profondeur le ou les fichiers joints, compare-les au projet CLARITY courant et prépare les propositions CRUD précises à valider.'
+    : 'Continue avec le contexte documentaire précédent et réponds à ma demande. Si une modification du projet est nécessaire, propose-la sous forme d’action CRUD.');
 
-  // Never send the full project object/history to the model: it is expensive and
-  // can make simple questions needlessly slow.
-  const context = {
-    connectedUser: { id:user.id, email:user.email, role:user.role },
-    project: compactCopilotProject(project),
-    previousAnalysis: memory.analysis || {},
-    previousFiles: Array.isArray(memory.files) ? memory.files.slice(-10) : [],
-    conversation: (memory.history || []).slice(-6).map((x:any)=>({
-      role:x.role, text:trimCopilotText(x.text, 3500), files:x.files||[]
-    })),
+  // Direct Line ne doit pas recevoir des milliers de lignes de contexte conversationnel inutile.
+  // On envoie le projet courant + le document réel + les quelques derniers échanges utiles.
+  const context={
+    user:{id:user.id,displayName:user.displayName,email:user.email,role:user.role},
+    project:{id:project.id,code:project.code,name:project.name,description:project.description,client:project.client,status:project.status,priority:project.priority,startDate:project.startDate,endDate:project.endDate,budget:project.budget,tasks:project.tasks||[],milestones:project.milestones||[],risks:project.risks||[]},
+    previousAnalysis:memory.analysis||{},
+    previousFiles:memory.files||[],
+    recentConversation:(memory.history||[]).slice(-6),
   };
 
-  const evidence = files.length
-    ? await extractDocumentEvidenceForCopilot(files)
-    : trimCopilotText(memory.evidence || '', 30000);
+  const instruction=`Tu es l’agent Microsoft Copilot Studio de CLARITY PM. Tu es le SEUL moteur IA utilisé pour cette analyse documentaire. N’utilise ni Gemini, ni OpenAI, ni un autre provider.
 
-  const prompt = `${COPILOT_SYSTEM_PROMPT}
+MISSION: analyser réellement le contenu du document fourni, le comparer au projet CLARITY courant, puis produire des propositions CRUD directement exploitables par le backend CLARITY.
 
-CONTEXTE PROJET CLARITY:
+RÈGLES ABSOLUES:
+1. Réponds UNIQUEMENT avec un objet JSON valide, sans markdown et sans bloc de code.
+2. Le schéma exact est: {"reply":"...","analysis":{"summary":"...","findings":[],"contradictions":[],"recommendations":[],"elements":{"tasks":[],"milestones":[],"risks":[],"dates":[],"budgets":[],"decisions":[],"corrections":[],"missing":[]}},"actions":[]}.
+3. Chaque action doit contenir: proposalId unique, type, targetProjectId="${String(project.id)}", reason, source et, selon le type, id+patch ou task/milestone/risk.
+4. Types autorisés: update_project, add_task, update_task, add_milestone, update_milestone, add_risk, update_risk.
+5. Ne supprime jamais.
+6. Pour une création, ne fabrique jamais d’id final. Pour une tâche rattachée à un nouveau jalon, utilise milestoneProposalId correspondant au proposalId du jalon créé.
+7. Pour une modification, n’utilise que les IDs existants dans le projet fourni.
+8. Ne propose que les changements réellement justifiés par le document et absents ou différents dans CLARITY.
+9. Pour chaque action, donne une source exploitable: nom du fichier + feuille + ligne si Excel, ou page si PDF/DOCX lorsque disponible.
+10. Si aucune modification n’est justifiée, actions doit être [].
+11. Le backend CLARITY fera la validation finale et l’écriture PostgreSQL uniquement après confirmation de l’utilisateur.
+
+CONTEXTE PROJET:
 ${JSON.stringify(context)}
 
-DOCUMENTS FOURNIS / CONTEXTE DOCUMENTAIRE:
-${evidence || '[Aucun document fourni ou mémorisé]'}
+DOCUMENT(S) FOURNI(S):
+${evidence ? evidence.slice(0,120000) : '[Aucun nouveau document]'}
 
 DEMANDE UTILISATEUR:
 ${effectiveMessage}`;
 
-  // Files need document-capable reasoning; ordinary chat is routed to the
-  // fastest available provider. This avoids selecting a slow document route
-  // for every short follow-up.
-  const task = files.length ? 'document' : (effectiveMessage.length < 500 ? 'fast' : 'reasoning');
-  const gateway = await callGatewayText({prompt,isJson:true,task});
-  if (!gateway?.text) throw new Error('Aucun provider IA opérationnel. Configure au moins un compte dans Administration → AI Provider Hub.');
-
+  const dl=await getCopilotStudioDirectLineToken();
+  const sent=await sendCopilotStudioActivity(dl.token,dl.conversationId,instruction,user);
+  const reply=await waitForCopilotStudioReply(dl.token,dl.conversationId,sent?.id);
   let result:any;
-  try { result=cleanCopilotJson(gateway.text); }
+  try { result=cleanCopilotJson(reply.text); }
   catch {
-    result={
-      reply:gateway.text,
-      analysis:{summary:'Réponse reçue mais non structurée.',findings:[],contradictions:[],recommendations:[],elements:{tasks:[],milestones:[],risks:[],dates:[],budgets:[],decisions:[],corrections:[],missing:[]}},
-      actions:[]
-    };
+    result={reply:reply.text,analysis:{summary:reply.text,findings:[],contradictions:[],recommendations:[],elements:{tasks:[],milestones:[],risks:[],dates:[],budgets:[],decisions:[],corrections:[],missing:[]}},actions:[]};
   }
 
-  // IMPORTANT: analysis is read-only. The backend stores proposals only;
-  // no project CRUD function is called here.
   const filesMeta=files.map(f=>({name:f.originalname,size:f.size,type:f.mimetype}));
   const incomingActions=(Array.isArray(result.actions)?result.actions:[])
-    .map((a:any,i:number)=>normalizeCopilotAction(a,project,i))
-    .filter(Boolean)
-    .sort((a:any,b:any)=>{
-      const rank=(x:any)=>x?.type==='add_milestone'?0:x?.type==='add_task'?1:2;
-      return rank(a)-rank(b);
-    });
-
+    .map((a:any,i:number)=>normalizeCopilotAction(a,project,i)).filter(Boolean)
+    .sort((a:any,b:any)=>{const rank=(x:any)=>x?.type==='add_milestone'?0:x?.type==='add_task'?1:2; return rank(a)-rank(b);});
   const previousActions=Array.isArray(memory.pendingActions)?memory.pendingActions:[];
   const actionMap=new Map(previousActions.map((a:any,i:number)=>[copilotActionKey(a,i),{...a,_key:copilotActionKey(a,i)}]));
   incomingActions.forEach((a:any)=>actionMap.set(a.proposalId,a));
   const pendingActions=Array.from(actionMap.values());
-
-  const clarityUpdate = canonicalClarityProjectUpdate(project, pendingActions, filesMeta);
-  const proposalSet={
-    version:2, projectId:String(project.id), projectCode:String(project.code||''),
-    projectName:String(project.name||''), generatedAt:new Date().toISOString(),
-    proposals:pendingActions, clarityUpdate
-  };
-  const history=[
-    ...(memory.history||[]),
-    {role:'user',text:effectiveMessage,files:filesMeta,userEmail:user.email},
-    {role:'assistant',text:String(result.reply||''),analysis:result.analysis||{},proposalSet}
-  ];
-
-  await saveCopilotMemory(project.id,user.id,{
-    // Keep the evidence in memory for follow-ups, but only a compact slice is
-    // sent to the model on subsequent requests.
-    evidence:files.length?evidence:(memory.evidence||''),
-    files:files.length?filesMeta:(memory.files||[]),
-    analysis:result.analysis||memory.analysis||{},
-    pendingActions,history
-  });
-
-  return {
-    ...result, actions:pendingActions, proposalSet, clarityUpdate,
-    provider:gateway.account.provider, account:gateway.account.name,
-    model:gateway.model || gateway.account.model
-  };
+  const proposalSet={version:1,projectId:String(project.id),projectCode:String(project.code||''),projectName:String(project.name||''),generatedAt:new Date().toISOString(),proposals:pendingActions};
+  const history=[...(memory.history||[]),{role:'user',text:effectiveMessage,files:filesMeta,userEmail:user.email},{role:'assistant',text:String(result.reply||reply.text),analysis:result.analysis||{},proposalSet}];
+  await saveCopilotMemory(project.id,user.id,{evidence:files.length?evidence:memory.evidence,files:files.length?filesMeta:memory.files,analysis:result.analysis||memory.analysis||{},pendingActions,history});
+  return {...result,actions:pendingActions,proposalSet,provider:'MICROSOFT_COPILOT_STUDIO',account:'Copilot Studio',model:'Direct Line',conversationId:dl.conversationId};
 }
 
 function applyCopilotActions(project: Project, actions: any[], user: MicrosoftSessionUser) {
@@ -532,18 +469,9 @@ async function runM365Copilot(project: Project, files: Express.Multer.File[], me
     parsed = { reply, analysis:{summary:reply,findings:[],contradictions:[],recommendations:[],elements:{tasks:[],milestones:[],risks:[],dates:[],budgets:[],decisions:[],corrections:[],missing:[]}}, actions:[] };
   }
   const filesMeta = files.map(f=>({name:f.originalname,size:f.size,type:f.mimetype}));
-  const incomingActions=(Array.isArray(parsed.actions)?parsed.actions:[])
-    .map((a:any,i:number)=>normalizeCopilotAction(a,project,i))
-    .filter(Boolean);
-  const previousActions=Array.isArray(memory.pendingActions)?memory.pendingActions:[];
-  const actionMap=new Map(previousActions.map((a:any,i:number)=>[copilotActionKey(a,i),{...a,_key:copilotActionKey(a,i)}]));
-  incomingActions.forEach((a:any)=>actionMap.set(a.proposalId,a));
-  const pendingActions=Array.from(actionMap.values());
-  const clarityUpdate=canonicalClarityProjectUpdate(project,pendingActions,filesMeta);
-  const proposalSet={version:2,projectId:String(project.id),projectCode:String(project.code||''),projectName:String(project.name||''),generatedAt:new Date().toISOString(),proposals:pendingActions,clarityUpdate};
-  const history=[...(memory.history||[]),{role:'user',text:effectiveMessage,files:filesMeta,userEmail:user.email},{role:'assistant',text:String(parsed.reply||reply),analysis:parsed.analysis||{},proposalSet}];
-  await saveCopilotMemory(project.id,user.id,{evidence,files:filesMeta,analysis:parsed.analysis||{},pendingActions,history});
-  return { ...parsed, actions:pendingActions, proposalSet, clarityUpdate, conversationId: convId };
+  const history=[...(memory.history||[]),{role:'user',text:effectiveMessage,files:filesMeta,userEmail:user.email},{role:'assistant',text:String(parsed.reply||reply),analysis:parsed.analysis||{}}];
+  await saveCopilotMemory(project.id,user.id,{evidence,files:filesMeta,analysis:parsed.analysis||{},pendingActions:Array.isArray(parsed.actions)?parsed.actions:[],history});
+  return { ...parsed, conversationId: convId };
 }
 
 // Runtime AI provider abstraction: semantic processing is delegated to the OAuth Gateway.
@@ -721,13 +649,6 @@ ACTIONS:
 - Ne supprime jamais un élément existant.
 - Les tâches, jalons et risques créés doivent être concrets et dédupliqués.
 - Toute action doit être justifiée par une preuve documentaire ou la demande explicite de l'utilisateur.
-- Le JSON d'actions doit correspondre aux structures persistées par CLARITY : Project, Task, Milestone et Risk.
-- Champs Task autorisés : title, description, status, priority, assigneeId, milestoneId, startDate, dueDate, estimatedHours, actualHours, completionPercent, costEstimated, costActual, category, tags, subtasks, predecessorIds.
-- Champs Milestone autorisés : title, targetDate, actualDate, completed, description, deliverable, deliverables.
-- Champs Risk autorisés : title, description, category, probability, impact, mitigationPlan, contingencyPlan, ownerId, financialImpact, status, identifiedDate.
-- Pour une création, id=null dans la représentation JSON canonique ; CLARITY génère l'identifiant au moment de l'application. projectId doit toujours être l'id exact du projet courant.
-- Pour une mise à jour, id doit être l'identifiant exact déjà présent dans le projet et patch ne contient que les champs réellement modifiés.
-- Ne retourne jamais un nom de colonne SQL inventé, un champ UI inventé ou une structure de base différente de ces contrats.
 
 RÉPONSE:
 - Réponds en français.
@@ -755,72 +676,13 @@ Retourne STRICTEMENT ce JSON:
 }
 `;
 
-// Trouve la borne exacte du premier objet JSON complet en comptant les
-// accolades hors chaînes, au lieu d'un `\{[\s\S]*\}` gourmand qui peut
-// capturer du texte parasite après le JSON (ou s'arrêter sur une accolade
-// imbriquée si la réponse a été coupée) et faire échouer JSON.parse.
-function extractFirstJsonObject(text: string): string | null {
-  const start = text.indexOf('{');
-  if (start === -1) return null;
-  let depth = 0, inString = false, escape = false;
-  for (let i = start; i < text.length; i++) {
-    const c = text[i];
-    if (inString) {
-      if (escape) escape = false;
-      else if (c === '\\') escape = true;
-      else if (c === '"') inString = false;
-      continue;
-    }
-    if (c === '"') { inString = true; continue; }
-    if (c === '{') depth++;
-    else if (c === '}') { depth--; if (depth === 0) return text.slice(start, i + 1); }
-  }
-  return null; // objet jamais refermé : probablement tronqué
-}
-
 function cleanCopilotJson(text: string): any {
   const cleaned = cleanJsonResponse(text);
-  try { return JSON.parse(cleaned); } catch { /* on essaie les stratégies suivantes */ }
-  const exact = extractFirstJsonObject(cleaned);
-  if (exact) {
-    try { return JSON.parse(exact); } catch { /* toujours invalide, on tente la réparation */ }
+  try { return JSON.parse(cleaned); } catch {
+    const match = cleaned.match(/\{[\s\S]*\}/);
+    if (match) return JSON.parse(match[0]);
+    throw new Error('La réponse du moteur Copilot n’est pas un JSON exploitable.');
   }
-  // Réponse coupée en plein milieu (limite de tokens du moteur IA atteinte
-  // pendant une analyse documentaire volumineuse) : plutôt que de perdre
-  // tout le travail d'analyse, on referme au mieux les tableaux/objets
-  // encore ouverts pour récupérer ce qui a été généré jusque-là.
-  const repaired = repairTruncatedJson(cleaned);
-  if (repaired) return JSON.parse(repaired);
-  throw new Error('La réponse du moteur Copilot n’est pas un JSON exploitable.');
-}
-
-// Même logique de réparation que côté routeur IA (src/ai_router.ts), utilisée
-// ici en dernier recours quand le JSON reçu par le Copilot est tronqué.
-function repairTruncatedJson(partial: string): string | null {
-  let text = partial.trim();
-  const start = text.indexOf('{');
-  if (start === -1) return null;
-  text = text.slice(start);
-  let inString = false, escape = false;
-  const stack: string[] = [];
-  let lastSafe = -1;
-  for (let i = 0; i < text.length; i++) {
-    const c = text[i];
-    if (inString) {
-      if (escape) escape = false;
-      else if (c === '\\') escape = true;
-      else if (c === '"') inString = false;
-      continue;
-    }
-    if (c === '"') { inString = true; continue; }
-    if (c === '{' || c === '[') stack.push(c);
-    else if (c === '}' || c === ']') stack.pop();
-    if (!inString && (stack.length === 0 || c === ',')) lastSafe = i;
-  }
-  if (lastSafe > -1 && lastSafe < text.length - 1) text = text.slice(0, lastSafe + 1).replace(/,\s*$/, '');
-  if (inString) text += '"';
-  for (let i = stack.length - 1; i >= 0; i--) text += stack[i] === '{' ? '}' : ']';
-  try { JSON.parse(text); return text; } catch { return null; }
 }
 
 async function runCopilot(project: Project, files: Express.Multer.File[], message: string, user: MicrosoftSessionUser) {
@@ -877,6 +739,44 @@ async function runCopilot(project: Project, files: Express.Multer.File[], messag
   });
   return result;
 }
+
+function applyCopilotActions(project: Project, actions: any[], user: MicrosoftSessionUser) {
+  const applied: any[] = [];
+  for (const action of Array.isArray(actions) ? actions : []) {
+    try {
+      switch (action?.type) {
+        case 'update_project': {
+          const patch = action.patch && typeof action.patch === 'object' ? action.patch : {};
+          const allowed = ['name','code','description','client','managerName','managerId','status','priority','methodology','startDate','endDate','totalBudget','currency'];
+          const safe = Object.fromEntries(Object.entries(patch).filter(([k,v]) => allowed.includes(k) && v !== undefined));
+          if (Object.keys(safe).length) { const out = dbStore.updateProject(project.id, safe as any, user as any); if (out) applied.push({type:action.type, data:out}); }
+          break;
+        }
+        case 'add_task': {
+          if (!RBAC.canManageTasks(user.role)) break;
+          const t=action.task||{}; const out=dbStore.addTask(project.id,{id:`tsk-ai-${crypto.randomUUID()}`,projectId:project.id,title:String(t.title||'Tâche IA'),description:String(t.description||''),status:['TODO','IN_PROGRESS','REVIEW','DONE','BLOCKED'].includes(t.status)?t.status:'TODO',priority:['LOW','MEDIUM','HIGH','CRITICAL'].includes(t.priority)?t.priority:'MEDIUM',assigneeId:t.assigneeId,startDate:normalizeDate(t.startDate)||new Date().toISOString().split('T')[0],dueDate:normalizeDate(t.dueDate)||project.endDate,estimatedHours:Number(t.estimatedHours)||0,actualHours:0,completionPercent:Number(t.completionPercent)||0,costEstimated:Number(t.costEstimated)||0,costActual:0,category:String(t.category||'DOCUMENT-IA'),tags:Array.isArray(t.tags)?t.tags.map(String):['DOCUMENT-IA'],subtasks:[],predecessorIds:Array.isArray(t.predecessorIds)?t.predecessorIds:[]},user as any); if(out) applied.push({type:action.type,data:out}); break;
+        }
+        case 'update_task': {
+          if (!RBAC.canManageTasks(user.role)) break; const out=dbStore.updateTask(project.id,String(action.id),action.patch||{},user as any); if(out) applied.push({type:action.type,data:out}); break;
+        }
+        case 'add_milestone': {
+          const m=action.milestone||{}; const out=dbStore.addMilestone(project.id,{id:`ms-ai-${crypto.randomUUID()}`,projectId:project.id,title:String(m.title||'Jalon IA'),targetDate:normalizeDate(m.targetDate)||project.endDate,completed:Boolean(m.completed),description:String(m.description||''),deliverable:String(m.deliverable||'')},user as any); if(out) applied.push({type:action.type,data:out}); break;
+        }
+        case 'update_milestone': {
+          const out=dbStore.updateMilestone(project.id,String(action.id),action.patch||{},user as any); if(out) applied.push({type:action.type,data:out}); break;
+        }
+        case 'add_risk': {
+          if (!RBAC.canManageRisks(user.role)) break; const r=action.risk||{}; const out=dbStore.addRisk(project.id,{id:`rsk-ai-${crypto.randomUUID()}`,projectId:project.id,title:String(r.title||'Risque IA'),description:String(r.description||''),category:['TECHNIQUE','BUDGET','DELAIS','RESSOURCES','JURIDIQUE','EXTERNE'].includes(r.category)?r.category:'TECHNIQUE',probability:Math.min(5,Math.max(1,Number(r.probability)||3)),impact:Math.min(5,Math.max(1,Number(r.impact)||3)),mitigationPlan:String(r.mitigationPlan||''),contingencyPlan:String(r.contingencyPlan||''),status:['ACTIVE','MITIGATED','CLOSED','OCCURRED'].includes(r.status)?r.status:'ACTIVE',identifiedDate:new Date().toISOString().split('T')[0]},user as any); if(out) applied.push({type:action.type,data:out}); break;
+        }
+        case 'update_risk': {
+          if (!RBAC.canManageRisks(user.role)) break; const out=dbStore.updateRisk(project.id,String(action.id),action.patch||{},user as any); if(out) applied.push({type:action.type,data:out}); break;
+        }
+      }
+    } catch (e) { console.warn('Copilot action ignorée:', e); }
+  }
+  return applied;
+}
+
 
 async function uploadToOpenAIAndExtractFiles(files: Express.Multer.File[], prompt: string) {
   const config = await getAIConfig();
@@ -2014,76 +1914,6 @@ app.post('/api/import-json/validate', requireOrigin, requireAuth, (req: Request,
   res.json({ success: true, data: normalizeJsonImport(type, items, user) });
 });
 
-
-function canonicalJsonToCopilotActions(project: Project, payload: any, user: MicrosoftSessionUser) {
-  if (!payload || payload.schema !== 'clarity.pm.project-update.v1' || payload.version !== 1) {
-    throw new Error('Schéma JSON CLARITY invalide.');
-  }
-  if (String(payload.project?.id || '') !== String(project.id)) {
-    throw new Error('Le JSON cible un autre projet.');
-  }
-  const operations = Array.isArray(payload.operations) ? payload.operations : [];
-  if (!operations.length || operations.length > JSON_IMPORT_LIMIT) throw new Error(`Le JSON doit contenir entre 1 et ${JSON_IMPORT_LIMIT} opérations.`);
-  const actions:any[]=[];
-  for (let i=0;i<operations.length;i++) {
-    const op=operations[i]||{};
-    const entity=String(op.entity||'').toLowerCase();
-    const mode=String(op.op||'').toLowerCase();
-    const proposalId=String(op.proposalId||`json-${crypto.randomUUID()}`);
-    if (!['create','update'].includes(mode) || !['project','task','milestone','risk'].includes(entity)) throw new Error(`Opération ${i+1}: op/entity invalide.`);
-    if (entity==='project') {
-      if (mode!=='update' || String(op.id)!==String(project.id)) throw new Error(`Opération ${i+1}: projet invalide.`);
-      if (!RBAC.canManageProject(user.role)) throw new Error('Droits insuffisants pour modifier le projet.');
-      actions.push(normalizeCopilotAction({proposalId,type:'update_project',id:project.id,targetProjectId:project.id,patch:op.patch||{},reason:op.reason,source:op.source},project,i));
-    } else if (entity==='task') {
-      if (mode==='update') {
-        const id=String(op.id||''); if (!project.tasks.some(t=>String(t.id)===id)) throw new Error(`Opération ${i+1}: tâche ${id} introuvable.`);
-        if (!RBAC.canManageTasks(user.role)) throw new Error('Droits insuffisants pour modifier les tâches.');
-        actions.push(normalizeCopilotAction({proposalId,type:'update_task',id,targetProjectId:project.id,patch:op.patch||{},reason:op.reason,source:op.source},project,i));
-      } else {
-        if (!RBAC.canManageTasks(user.role)) throw new Error('Droits insuffisants pour créer des tâches.');
-        const data={...(op.data||{})}; delete data.id; delete data.projectId;
-        actions.push(normalizeCopilotAction({proposalId,type:'add_task',targetProjectId:project.id,task:{...data,projectId:project.id},reason:op.reason,source:op.source},project,i));
-      }
-    } else if (entity==='milestone') {
-      if (mode==='update') {
-        const id=String(op.id||''); if (!project.milestones.some(m=>String(m.id)===id)) throw new Error(`Opération ${i+1}: jalon ${id} introuvable.`);
-        actions.push(normalizeCopilotAction({proposalId,type:'update_milestone',id,targetProjectId:project.id,patch:op.patch||{},reason:op.reason,source:op.source},project,i));
-      } else {
-        if (!RBAC.canManageProject(user.role)) throw new Error('Droits insuffisants pour créer des jalons.');
-        const data={...(op.data||{})}; delete data.id; delete data.projectId;
-        actions.push(normalizeCopilotAction({proposalId,type:'add_milestone',targetProjectId:project.id,milestone:data,reason:op.reason,source:op.source},project,i));
-      }
-    } else if (entity==='risk') {
-      if (mode==='update') {
-        const id=String(op.id||''); if (!project.risks.some(r=>String(r.id)===id)) throw new Error(`Opération ${i+1}: risque ${id} introuvable.`);
-        if (!RBAC.canManageRisks(user.role)) throw new Error('Droits insuffisants pour modifier les risques.');
-        actions.push(normalizeCopilotAction({proposalId,type:'update_risk',id,targetProjectId:project.id,patch:op.patch||{},reason:op.reason,source:op.source},project,i));
-      } else {
-        if (!RBAC.canManageRisks(user.role)) throw new Error('Droits insuffisants pour créer des risques.');
-        const data={...(op.data||{})}; delete data.id; delete data.projectId;
-        actions.push(normalizeCopilotAction({proposalId,type:'add_risk',targetProjectId:project.id,risk:data,reason:op.reason,source:op.source},project,i));
-      }
-    }
-  }
-  return actions.filter(Boolean);
-}
-
-app.post('/api/projects/:id/copilot/apply-json', requireOrigin, requireAuth, requireRole(RBAC.canManageProject), async (req: Request, res: Response) => {
-  try {
-    const project=dbStore.getProjectById(String(req.params.id));
-    if(!project) return res.status(404).json({error:'Projet introuvable.'});
-    const user=currentUser(req);
-    if(req.body?.confirmed!==true) return res.status(400).json({error:'Confirmation utilisateur requise.'});
-    const actions=canonicalJsonToCopilotActions(project,req.body?.document||req.body,user);
-    const result=applyCopilotActions(project,actions,user);
-    const updated=dbStore.getProjectById(project.id);
-    res.json({success:true,data:{applied:result.applied,failed:result.failed,project:updated}});
-  } catch(e:any) {
-    res.status(400).json({error:e?.message||'JSON CLARITY impossible à appliquer.'});
-  }
-});
-
 app.post('/api/import-json/confirm', requireOrigin, requireAuth, async (req: Request, res: Response) => {
   const user = currentUser(req);
   const type = req.body?.type as 'projects'|'tasks'|'milestones';
@@ -2330,25 +2160,13 @@ app.get('/api/projects/:id/copilot/proposals.json', requireRole(RBAC.canManagePr
   } catch(e:any) { res.status(500).json({error:e?.message||'Impossible de charger le JSON des propositions.'}); }
 });
 
-app.get('/api/projects/:id/copilot/update.json', requireRole(RBAC.canManageProject), async (req: Request, res: Response) => {
-  try {
-    const project=dbStore.getProjectById(String(req.params.id));
-    if(!project) return res.status(404).json({error:'Projet introuvable.'});
-    const user=currentUser(req); const memory=await loadCopilotMemory(project.id,user.id);
-    const files=Array.isArray(memory.files)?memory.files:[];
-    const clarityUpdate:any=canonicalClarityProjectUpdate(project,Array.isArray(memory.pendingActions)?memory.pendingActions:[],files);
-    clarityUpdate.generatedFor={id:String(user.id),email:String(user.email),displayName:String(user.displayName||''),role:String(user.role)};
-    res.json(clarityUpdate);
-  } catch(e:any) { res.status(500).json({error:e?.message||'Impossible de régénérer le JSON CLARITY.'}); }
-});
-
 app.post('/api/projects/:id/copilot', upload.array('files', 10), requireRole(RBAC.canManageProject), async (req: Request, res: Response) => {
   try {
     const project = dbStore.getProjectById(String(req.params.id));
     if (!project) return res.status(404).json({ error:'Projet introuvable.' });
     const files = ((req as any).files || []) as Express.Multer.File[];
     const message = String(req.body?.message || '').trim();
-    const result = await runGatewayCopilot(project, files, message, currentUser(req));
+    const result = await runCopilotStudio(project, files, message, currentUser(req));
     // IMPORTANT: Copilot never changes the project during analysis.
     // Actions returned by the AI are proposals and require explicit user confirmation.
     const proposedActions = Array.isArray(result.actions) ? result.actions : [];
@@ -2357,7 +2175,7 @@ app.post('/api/projects/:id/copilot', upload.array('files', 10), requireRole(RBA
       message: 'J’ai identifié des modifications possibles. Voulez-vous les appliquer au projet ?',
       actions: proposedActions
     } : { required: false, message: '', actions: [] };
-    res.json({ success:true, data:{ reply:result.reply || '', analysis:result.analysis || {}, actions:proposedActions, confirmation, applied:[], project, clarityUpdate:result.clarityUpdate || result.proposalSet?.clarityUpdate || null, proposalSet:result.proposalSet, provider:result.provider, account:result.account, model:result.model } });
+    res.json({ success:true, data:{ reply:result.reply || '', analysis:result.analysis || {}, actions:proposedActions, confirmation, applied:[], project, provider:result.provider, account:result.account, model:result.model } });
   } catch (e:any) {
     console.error('Copilot error:', e);
     const status = Number(e?.status) === 401 ? 401 : 500;
@@ -2387,14 +2205,8 @@ app.post('/api/projects/:id/copilot/apply', requireRole(RBAC.canManageProject), 
     const storedActions = Array.isArray(memory.pendingActions) ? memory.pendingActions : [];
     if (!storedActions.length) return res.status(400).json({ error:'Aucune proposition en attente à appliquer.' });
     const proposalIds = Array.isArray(req.body?.proposalIds) ? req.body.proposalIds.map(String) : [];
-    // SECURITY: the browser can only select proposal IDs already stored by the
-    // server. Never accept action objects from the client, even with confirmed=true.
-    if (!proposalIds.length) return res.status(400).json({ error:'Aucune modification sélectionnée.', code:'NO_SELECTED_PROPOSALS' });
-    const requested = storedActions.filter((a:any)=>proposalIds.includes(String(a.proposalId||a._key)));
-    if (!requested.length) return res.status(400).json({ error:'Les propositions sélectionnées ne sont plus valides.', code:'STALE_PROPOSALS' });
-    // Every proposal must belong to this exact project.
-    const invalid = requested.find((a:any)=>String(a.targetProjectId||project.id)!==String(project.id));
-    if (invalid) return res.status(400).json({ error:'Une proposition cible un autre projet.', code:'INVALID_PROJECT_TARGET' });
+    const requested = proposalIds.length ? storedActions.filter((a:any)=>proposalIds.includes(String(a.proposalId||a._key))) : (Array.isArray(req.body?.actions) ? req.body.actions : storedActions);
+    if (!requested.length) return res.status(400).json({ error:'Aucune modification sélectionnée.', code:'NO_SELECTED_PROPOSALS' });
     const result = applyCopilotActions(project, requested, user);
     const appliedIds = new Set(result.applied.map((x:any)=>String(x.proposalId)));
     const remaining = storedActions.filter((a:any)=>!appliedIds.has(String(a.proposalId||a._key)));

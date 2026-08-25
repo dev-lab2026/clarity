@@ -5,7 +5,7 @@ import { CheckCircle2, Loader2, LogIn, Paperclip, ShieldCheck, XCircle, Send } f
 
 interface Props { project: Project; currentUser?: MicrosoftUser | null; onProjectUpdated?: (p: Project) => void; }
 
-type PendingAction = { type: string; id?: string; proposalId?: string; _key?: string; targetProjectId?: string; patch?: any; task?: any; milestone?: any; risk?: any; reason?: string };
+type PendingAction = { type: string; id?: string; patch?: any; task?: any; milestone?: any; risk?: any; reason?: string };
 
 const CLIENT_ID = window.CLARITY_CONFIG?.entraClientId || import.meta.env.VITE_ENTRA_CLIENT_ID || '';
 const TENANT_ID = window.CLARITY_CONFIG?.entraTenantId || import.meta.env.VITE_ENTRA_TENANT_ID || '';
@@ -61,7 +61,7 @@ export const Microsoft365CopilotChat: React.FC<Props> = ({ project, currentUser,
     if (!msal) throw new Error('Microsoft Entra n’est pas initialisé.');
     let acc = account;
     if (!acc) {
-      const r = await msal.loginPopup({ scopes: ['openid','profile','email',...GRAPH_SCOPES], prompt:'select_account', loginHint: currentUser?.email });
+      const r = await msal.loginPopup({ scopes: ['openid','profile','email',...GRAPH_SCOPES], prompt:'select_account' });
       acc = r.account; setAccount(acc); setConnected(true);
     }
     const tokenRequest = { account: acc!, scopes: GRAPH_SCOPES };
@@ -120,9 +120,7 @@ export const Microsoft365CopilotChat: React.FC<Props> = ({ project, currentUser,
     if (!pending.length || applying) return;
     setApplying(true); setError('');
     try {
-      const ids=pending.map((a:any)=>String((a as any).proposalId||(a as any)._key||'' )).filter(Boolean);
-      if(!ids.length) throw new Error('Aucune proposition valide à appliquer.');
-      const r=await fetch(`/api/projects/${encodeURIComponent(project.id)}/copilot/apply`,{method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify({confirmed:true,proposalIds:ids})});
+      const r=await fetch(`/api/projects/${encodeURIComponent(project.id)}/copilot/apply`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({confirmed:true})});
       const data=await r.json();
       if(!r.ok) throw new Error(data.error||'Application impossible.');
       setPending([]); setMessages(v=>[...v,{role:'assistant',text:`✅ ${data.data?.applied?.length||0} modification(s) appliquée(s) au projet après votre confirmation.`}]);
