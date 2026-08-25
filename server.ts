@@ -321,7 +321,11 @@ async function runCopilotStudio(project: Project, files: Express.Multer.File[], 
 MISSION: analyser réellement le contenu du document fourni, le comparer au projet CLARITY courant, puis produire des propositions CRUD directement exploitables par le backend CLARITY.
 
 RÈGLES ABSOLUES:
+<<<<<<< HEAD
 1. Réponds UNIQUEMENT avec un objet JSON valide, sans markdown et sans bloc de code.
+=======
+1. Réponds UNIQUEMENT avec un objet JSON valide, sans markdown, sans ```.
+>>>>>>> 29033b2b7fb759905c8fdd6fc30e3f3fff58abe1
 2. Le schéma exact est: {"reply":"...","analysis":{"summary":"...","findings":[],"contradictions":[],"recommendations":[],"elements":{"tasks":[],"milestones":[],"risks":[],"dates":[],"budgets":[],"decisions":[],"corrections":[],"missing":[]}},"actions":[]}.
 3. Chaque action doit contenir: proposalId unique, type, targetProjectId="${String(project.id)}", reason, source et, selon le type, id+patch ou task/milestone/risk.
 4. Types autorisés: update_project, add_task, update_task, add_milestone, update_milestone, add_risk, update_risk.
