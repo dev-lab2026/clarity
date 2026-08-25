@@ -104,61 +104,6 @@ function getMicrosoftRedirectUri(req:Request){
 }
 
 
-
-// Copilot Studio / Direct Line integration
-const COPILOT_AGENT_ID = String(process.env.COPILOT_AGENT_ID || 'cr299_clarity_tB6p_X').trim();
-const COPILOT_ENVIRONMENT_ID = String(process.env.COPILOT_ENVIRONMENT_ID || 'Default-1d593042-a69d-49e0-8d1c-0daf8ac1717b').trim();
-const COPILOT_TENANT_ID = String(process.env.COPILOT_TENANT_ID || process.env.MICROSOFT_TENANT_ID || '').trim();
-const COPILOT_DIRECTLINE_TOKEN_ENDPOINT = String(process.env.COPILOT_DIRECTLINE_TOKEN_ENDPOINT || '').trim();
-const CLARITY_API_KEY = String(process.env.CLARITY_API_KEY || '').trim();
-
-function requireClarityApiKey(req: Request, res: Response, next: NextFunction) {
-  if (!CLARITY_API_KEY) return res.status(503).json({ error: 'CLARITY_API_KEY non configurée.' });
-  const auth = String(req.headers.authorization || '');
-  const supplied = auth.startsWith('Bearer ') ? auth.slice(7).trim() : String(req.headers['x-clarity-api-key'] || '').trim();
-  if (!supplied || Buffer.byteLength(supplied) !== Buffer.byteLength(CLARITY_API_KEY) || !crypto.timingSafeEqual(Buffer.from(supplied), Buffer.from(CLARITY_API_KEY))) {
-    return res.status(401).json({ error: 'Clé API CLARITY invalide.' });
-  }
-  next();
-}
-
-async function getCopilotStudioToken() {
-  if (!COPILOT_DIRECTLINE_TOKEN_ENDPOINT) {
-    throw new Error('COPILOT_DIRECTLINE_TOKEN_ENDPOINT n’est pas configuré. Dans Copilot Studio, ouvrez Canaux → Application mobile et copiez le Point de terminaison du jeton.');
-  }
-  const r = await fetch(COPILOT_DIRECTLINE_TOKEN_ENDPOINT, { method: 'GET', headers: { Accept: 'application/json' } });
-  const text = await r.text();
-  if (!r.ok) throw new Error(`Copilot Studio token endpoint HTTP ${r.status}: ${text.slice(0,500)}`);
-  const data = JSON.parse(text);
-  if (!data.token || !data.conversationId) throw new Error('Copilot Studio n’a pas retourné token + conversationId.');
-  return { token: String(data.token), conversationId: String(data.conversationId), expiresIn: Number(data.expires_in || 1800) };
-}
-
-async function sendCopilotStudioMessage(token: string, conversationId: string, text: string, userId: string) {
-  const base = 'https://directline.botframework.com/v3/directline';
-  const send = await fetch(`${base}/conversations/${encodeURIComponent(conversationId)}/activities`, {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ type: 'message', from: { id: `clarity-${userId}` }, text })
-  });
-  if (!send.ok) throw new Error(`Copilot Studio Direct Line send HTTP ${send.status}: ${(await send.text()).slice(0,500)}`);
-  const sendData = await send.json().catch(() => ({}));
-  let watermark = '0';
-  const deadline = Date.now() + Math.max(10000, Number(process.env.COPILOT_POLL_TIMEOUT_MS || 45000));
-  while (Date.now() < deadline) {
-    const r = await fetch(`${base}/conversations/${encodeURIComponent(conversationId)}/activities?watermark=${encodeURIComponent(watermark)}`, { headers: { Authorization: `Bearer ${token}` } });
-    if (!r.ok) throw new Error(`Copilot Studio Direct Line receive HTTP ${r.status}: ${(await r.text()).slice(0,500)}`);
-    const data = await r.json();
-    watermark = String(data.watermark || watermark);
-    const replies = (Array.isArray(data.activities) ? data.activities : [])
-      .filter((a:any) => a?.type === 'message' && a?.from?.id && a.from.id !== `clarity-${userId}` && String(a.text || '').trim())
-      .map((a:any) => String(a.text).trim());
-    if (replies.length) return { reply: replies.join('\n\n'), activityId: String(sendData.id || '') };
-    await new Promise(resolve => setTimeout(resolve, 700));
-  }
-  throw new Error('Délai dépassé : Copilot Studio n’a pas répondu dans le délai configuré.');
-}
-
 const M365_COPILOT_GRAPH = 'https://graph.microsoft.com/beta';
 const M365_COPILOT_SCOPES = [
   'Sites.Read.All','Mail.Read','People.Read.All','OnlineMeetingTranscript.Read.All',
@@ -272,8 +217,6 @@ IMPORTANT: tu ne modifies jamais CLARITY directement. Tu proposes des actions CR
 Réponds STRICTEMENT en JSON: {"reply":"...","analysis":{"summary":"...","findings":[],"contradictions":[],"recommendations":[],"elements":{"tasks":[],"milestones":[],"risks":[],"dates":[],"budgets":[],"decisions":[],"corrections":[],"missing":[]}},"actions":[]}.
 Actions autorisées: update_project {patch}, add_task {task}, update_task {id,patch}, add_milestone {milestone}, update_milestone {id,patch}, add_risk {risk}, update_risk {id,patch}. Ne supprime jamais. Pour CHAQUE action, retourne un objet JSON complet avec type, id si modification d'un élément existant, patch/task/milestone/risk, reason, source et targetProjectId égal à l'identifiant exact du projet fourni. Pour une création, ne fabrique pas d'id de tâche/jalon/risque: CLARITY le générera. Pour rattacher une tâche à un jalon créé dans la même réponse, utilise task.milestoneProposalId égal au proposalId du add_milestone correspondant; pour un jalon existant, utilise task.milestoneId exact ou milestoneTitle. Ne crée jamais une action destinée à un autre projet. Le JSON doit être directement exploitable par le backend, sans markdown.
 
-`;
-
 function normalizeCopilotAction(raw:any, project:Project, index:number){
   const type=String(raw?.type||'').trim().toLowerCase();
   const allowed=['update_project','add_task','update_task','add_milestone','update_milestone','add_risk','update_risk'];
@@ -302,31 +245,123 @@ function copilotActionKey(a:any, index=0){
   return String(a?.proposalId || a?._key || `legacy-${String(a?.type||'action')}-${String(a?.id||index)}`);
 }
 
-async function runGatewayCopilot(project: Project, files: Express.Multer.File[], message: string, user: MicrosoftSessionUser) {
-  const memory = await loadCopilotMemory(project.id, user.id);
-  const evidence = files.length ? await extractDocumentEvidenceForCopilot(files) : (memory.evidence || '');
-  const effectiveMessage = message || (files.length ? 'Analyse en profondeur tous les fichiers joints, compare-les au projet et identifie précisément ce qui doit être ajouté ou corrigé.' : 'Continue avec le contexte documentaire précédent et réponds à ma demande.');
-  const context = {
-    connectedUser: { id:user.id, email:user.email, displayName:user.displayName, role:user.role },
-    project: { id:project.id, code:project.code, name:project.name, description:project.description, client:project.client, status:project.status, priority:project.priority, startDate:project.startDate, endDate:project.endDate, budget:project.budget, tasks:project.tasks||[], milestones:project.milestones||[], risks:project.risks||[] },
-    previousAnalysis: memory.analysis || {}, previousFiles: memory.files || [], conversation: (memory.history || []).slice(-12),
+async function getCopilotStudioDirectLineToken() {
+  const secret = String(process.env.COPILOT_DIRECTLINE_SECRET || '').trim();
+  if (!secret) throw new Error('COPILOT_DIRECTLINE_SECRET n’est pas configuré. Copilot Studio → Settings → Security → Web channel security → Secret 1.');
+  const response = await fetch('https://directline.botframework.com/v3/directline/tokens/generate', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${secret}` },
+  });
+  const text = await response.text();
+  let data:any = {};
+  try { data = text ? JSON.parse(text) : {}; } catch { data = { raw:text }; }
+  if (!response.ok || !data?.token || !data?.conversationId) {
+    throw new Error(`Copilot Studio Direct Line token impossible (${response.status}): ${String(data?.error?.message || data?.message || text || 'réponse vide').slice(0,800)}`);
+  }
+  return { token:String(data.token), conversationId:String(data.conversationId), expiresIn:Number(data.expires_in||1800) };
+}
+
+async function sendCopilotStudioActivity(token:string, conversationId:string, text:string, user:MicrosoftSessionUser) {
+  const response = await fetch(`https://directline.botframework.com/v3/directline/conversations/${encodeURIComponent(conversationId)}/activities`, {
+    method:'POST',
+    headers:{ Authorization:`Bearer ${token}`, 'Content-Type':'application/json' },
+    body:JSON.stringify({
+      type:'message',
+      locale:'fr-FR',
+      from:{ id:`clarity-${String(user.id).replace(/[^a-zA-Z0-9_-]/g,'_')}`, name:user.displayName },
+      text,
+    }),
+  });
+  const body=await response.text();
+  if(!response.ok) throw new Error(`Copilot Studio Direct Line: envoi impossible (${response.status}) ${body.slice(0,800)}`);
+  return body ? JSON.parse(body) : {};
+}
+
+async function waitForCopilotStudioReply(token:string, conversationId:string, sentActivityId?:string) {
+  const started=Date.now();
+  let watermark='';
+  const timeoutMs=Math.max(15000,Number(process.env.COPILOT_DIRECTLINE_TIMEOUT_MS||90000));
+  while(Date.now()-started < timeoutMs) {
+    const url=`https://directline.botframework.com/v3/directline/conversations/${encodeURIComponent(conversationId)}/activities${watermark?`?watermark=${encodeURIComponent(watermark)}`:''}`;
+    const response=await fetch(url,{headers:{Authorization:`Bearer ${token}`}});
+    const body=await response.text();
+    if(!response.ok) throw new Error(`Copilot Studio Direct Line: lecture impossible (${response.status}) ${body.slice(0,800)}`);
+    let data:any={}; try{data=body?JSON.parse(body):{};}catch{}
+    watermark=String(data?.watermark||watermark);
+    const activities=Array.isArray(data?.activities)?data.activities:[];
+    const candidates=activities.filter((a:any)=>a?.type==='message' && a?.from?.id && String(a.from.id)!=='' && (!sentActivityId || String(a.id)!==String(sentActivityId)));
+    const botMessages=candidates.filter((a:any)=>!String(a.from.id).startsWith('clarity-'));
+    const reply=botMessages.slice().reverse().find((a:any)=>String(a.text||'').trim());
+    if(reply?.text) return {text:String(reply.text), activity:reply};
+    await new Promise(r=>setTimeout(r,700));
+  }
+  throw new Error(`Copilot Studio n’a pas répondu dans le délai de ${Math.round(timeoutMs/1000)} secondes.`);
+}
+
+async function runCopilotStudio(project: Project, files: Express.Multer.File[], message: string, user: MicrosoftSessionUser) {
+  const memory=await loadCopilotMemory(project.id,user.id);
+  const evidence=files.length ? await extractDocumentEvidenceForCopilot(files) : String(memory.evidence||'');
+  const effectiveMessage=message || (files.length
+    ? 'Analyse en profondeur le ou les fichiers joints, compare-les au projet CLARITY courant et prépare les propositions CRUD précises à valider.'
+    : 'Continue avec le contexte documentaire précédent et réponds à ma demande. Si une modification du projet est nécessaire, propose-la sous forme d’action CRUD.');
+
+  // Direct Line ne doit pas recevoir des milliers de lignes de contexte conversationnel inutile.
+  // On envoie le projet courant + le document réel + les quelques derniers échanges utiles.
+  const context={
+    user:{id:user.id,displayName:user.displayName,email:user.email,role:user.role},
+    project:{id:project.id,code:project.code,name:project.name,description:project.description,client:project.client,status:project.status,priority:project.priority,startDate:project.startDate,endDate:project.endDate,budget:project.budget,tasks:project.tasks||[],milestones:project.milestones||[],risks:project.risks||[]},
+    previousAnalysis:memory.analysis||{},
+    previousFiles:memory.files||[],
+    recentConversation:(memory.history||[]).slice(-6),
   };
-  const prompt = `${COPILOT_SYSTEM_PROMPT}\n\nCONTEXTE PROJET CLARITY:\n${JSON.stringify(context,null,2)}\n\nDOCUMENTS FOURNIS PAR L'UTILISATEUR:\n${evidence || '[Aucun fichier fourni]'}\n\nRÈGLE DOCUMENTAIRE: le contenu ci-dessus est l'extraction technique des fichiers réels. Ton moteur IA doit effectuer tout le raisonnement sémantique, comparer les sources entre elles et avec CLARITY, citer les preuves (fichier/feuille/page/ligne si disponibles), détecter doublons et contradictions et ne rien inventer.\n\nDEMANDE:\n${effectiveMessage}`;
-  const gateway = await callGatewayText({prompt,isJson:true});
-  if (!gateway?.text) throw new Error('Aucun provider IA opérationnel. Configure au moins un compte dans Administration → AI Provider Hub.');
+
+  const instruction=`Tu es l’agent Microsoft Copilot Studio de CLARITY PM. Tu es le SEUL moteur IA utilisé pour cette analyse documentaire. N’utilise ni Gemini, ni OpenAI, ni un autre provider.
+
+MISSION: analyser réellement le contenu du document fourni, le comparer au projet CLARITY courant, puis produire des propositions CRUD directement exploitables par le backend CLARITY.
+
+RÈGLES ABSOLUES:
+1. Réponds UNIQUEMENT avec un objet JSON valide, sans markdown, sans ```.
+2. Le schéma exact est: {"reply":"...","analysis":{"summary":"...","findings":[],"contradictions":[],"recommendations":[],"elements":{"tasks":[],"milestones":[],"risks":[],"dates":[],"budgets":[],"decisions":[],"corrections":[],"missing":[]}},"actions":[]}.
+3. Chaque action doit contenir: proposalId unique, type, targetProjectId="${String(project.id)}", reason, source et, selon le type, id+patch ou task/milestone/risk.
+4. Types autorisés: update_project, add_task, update_task, add_milestone, update_milestone, add_risk, update_risk.
+5. Ne supprime jamais.
+6. Pour une création, ne fabrique jamais d’id final. Pour une tâche rattachée à un nouveau jalon, utilise milestoneProposalId correspondant au proposalId du jalon créé.
+7. Pour une modification, n’utilise que les IDs existants dans le projet fourni.
+8. Ne propose que les changements réellement justifiés par le document et absents ou différents dans CLARITY.
+9. Pour chaque action, donne une source exploitable: nom du fichier + feuille + ligne si Excel, ou page si PDF/DOCX lorsque disponible.
+10. Si aucune modification n’est justifiée, actions doit être [].
+11. Le backend CLARITY fera la validation finale et l’écriture PostgreSQL uniquement après confirmation de l’utilisateur.
+
+CONTEXTE PROJET:
+${JSON.stringify(context)}
+
+DOCUMENT(S) FOURNI(S):
+${evidence ? evidence.slice(0,120000) : '[Aucun nouveau document]'}
+
+DEMANDE UTILISATEUR:
+${effectiveMessage}`;
+
+  const dl=await getCopilotStudioDirectLineToken();
+  const sent=await sendCopilotStudioActivity(dl.token,dl.conversationId,instruction,user);
+  const reply=await waitForCopilotStudioReply(dl.token,dl.conversationId,sent?.id);
   let result:any;
-  try { result=cleanCopilotJson(gateway.text); }
-  catch { result={reply:gateway.text,analysis:{summary:gateway.text,findings:[],contradictions:[],recommendations:[],elements:{tasks:[],milestones:[],risks:[],dates:[],budgets:[],decisions:[],corrections:[],missing:[]}},actions:[]}; }
+  try { result=cleanCopilotJson(reply.text); }
+  catch {
+    result={reply:reply.text,analysis:{summary:reply.text,findings:[],contradictions:[],recommendations:[],elements:{tasks:[],milestones:[],risks:[],dates:[],budgets:[],decisions:[],corrections:[],missing:[]}},actions:[]};
+  }
+
   const filesMeta=files.map(f=>({name:f.originalname,size:f.size,type:f.mimetype}));
-  const incomingActions=(Array.isArray(result.actions)?result.actions:[]).map((a:any,i:number)=>normalizeCopilotAction(a,project,i)).filter(Boolean).sort((a:any,b:any)=>{const rank=(x:any)=>x?.type==='add_milestone'?0:x?.type==='add_task'?1:2; return rank(a)-rank(b);});
+  const incomingActions=(Array.isArray(result.actions)?result.actions:[])
+    .map((a:any,i:number)=>normalizeCopilotAction(a,project,i)).filter(Boolean)
+    .sort((a:any,b:any)=>{const rank=(x:any)=>x?.type==='add_milestone'?0:x?.type==='add_task'?1:2; return rank(a)-rank(b);});
   const previousActions=Array.isArray(memory.pendingActions)?memory.pendingActions:[];
   const actionMap=new Map(previousActions.map((a:any,i:number)=>[copilotActionKey(a,i),{...a,_key:copilotActionKey(a,i)}]));
   incomingActions.forEach((a:any)=>actionMap.set(a.proposalId,a));
   const pendingActions=Array.from(actionMap.values());
   const proposalSet={version:1,projectId:String(project.id),projectCode:String(project.code||''),projectName:String(project.name||''),generatedAt:new Date().toISOString(),proposals:pendingActions};
-  const history=[...(memory.history||[]),{role:'user',text:effectiveMessage,files:filesMeta,userEmail:user.email},{role:'assistant',text:String(result.reply||''),analysis:result.analysis||{},proposalSet}];
+  const history=[...(memory.history||[]),{role:'user',text:effectiveMessage,files:filesMeta,userEmail:user.email},{role:'assistant',text:String(result.reply||reply.text),analysis:result.analysis||{},proposalSet}];
   await saveCopilotMemory(project.id,user.id,{evidence:files.length?evidence:memory.evidence,files:files.length?filesMeta:memory.files,analysis:result.analysis||memory.analysis||{},pendingActions,history});
-  return {...result,actions:pendingActions,proposalSet,provider:gateway.account.provider,account:gateway.account.name,model:gateway.account.model};
+  return {...result,actions:pendingActions,proposalSet,provider:'MICROSOFT_COPILOT_STUDIO',account:'Copilot Studio',model:'Direct Line',conversationId:dl.conversationId};
 }
 
 function applyCopilotActions(project: Project, actions: any[], user: MicrosoftSessionUser) {
@@ -637,7 +672,8 @@ Retourne STRICTEMENT ce JSON:
     }
   },
   "actions": []
-}`;
+}
+`;
 
 function cleanCopilotJson(text: string): any {
   const cleaned = cleanJsonResponse(text);
@@ -701,6 +737,43 @@ async function runCopilot(project: Project, files: Express.Multer.File[], messag
     history,
   });
   return result;
+}
+
+function applyCopilotActions(project: Project, actions: any[], user: MicrosoftSessionUser) {
+  const applied: any[] = [];
+  for (const action of Array.isArray(actions) ? actions : []) {
+    try {
+      switch (action?.type) {
+        case 'update_project': {
+          const patch = action.patch && typeof action.patch === 'object' ? action.patch : {};
+          const allowed = ['name','code','description','client','managerName','managerId','status','priority','methodology','startDate','endDate','totalBudget','currency'];
+          const safe = Object.fromEntries(Object.entries(patch).filter(([k,v]) => allowed.includes(k) && v !== undefined));
+          if (Object.keys(safe).length) { const out = dbStore.updateProject(project.id, safe as any, user as any); if (out) applied.push({type:action.type, data:out}); }
+          break;
+        }
+        case 'add_task': {
+          if (!RBAC.canManageTasks(user.role)) break;
+          const t=action.task||{}; const out=dbStore.addTask(project.id,{id:`tsk-ai-${crypto.randomUUID()}`,projectId:project.id,title:String(t.title||'Tâche IA'),description:String(t.description||''),status:['TODO','IN_PROGRESS','REVIEW','DONE','BLOCKED'].includes(t.status)?t.status:'TODO',priority:['LOW','MEDIUM','HIGH','CRITICAL'].includes(t.priority)?t.priority:'MEDIUM',assigneeId:t.assigneeId,startDate:normalizeDate(t.startDate)||new Date().toISOString().split('T')[0],dueDate:normalizeDate(t.dueDate)||project.endDate,estimatedHours:Number(t.estimatedHours)||0,actualHours:0,completionPercent:Number(t.completionPercent)||0,costEstimated:Number(t.costEstimated)||0,costActual:0,category:String(t.category||'DOCUMENT-IA'),tags:Array.isArray(t.tags)?t.tags.map(String):['DOCUMENT-IA'],subtasks:[],predecessorIds:Array.isArray(t.predecessorIds)?t.predecessorIds:[]},user as any); if(out) applied.push({type:action.type,data:out}); break;
+        }
+        case 'update_task': {
+          if (!RBAC.canManageTasks(user.role)) break; const out=dbStore.updateTask(project.id,String(action.id),action.patch||{},user as any); if(out) applied.push({type:action.type,data:out}); break;
+        }
+        case 'add_milestone': {
+          const m=action.milestone||{}; const out=dbStore.addMilestone(project.id,{id:`ms-ai-${crypto.randomUUID()}`,projectId:project.id,title:String(m.title||'Jalon IA'),targetDate:normalizeDate(m.targetDate)||project.endDate,completed:Boolean(m.completed),description:String(m.description||''),deliverable:String(m.deliverable||'')},user as any); if(out) applied.push({type:action.type,data:out}); break;
+        }
+        case 'update_milestone': {
+          const out=dbStore.updateMilestone(project.id,String(action.id),action.patch||{},user as any); if(out) applied.push({type:action.type,data:out}); break;
+        }
+        case 'add_risk': {
+          if (!RBAC.canManageRisks(user.role)) break; const r=action.risk||{}; const out=dbStore.addRisk(project.id,{id:`rsk-ai-${crypto.randomUUID()}`,projectId:project.id,title:String(r.title||'Risque IA'),description:String(r.description||''),category:['TECHNIQUE','BUDGET','DELAIS','RESSOURCES','JURIDIQUE','EXTERNE'].includes(r.category)?r.category:'TECHNIQUE',probability:Math.min(5,Math.max(1,Number(r.probability)||3)),impact:Math.min(5,Math.max(1,Number(r.impact)||3)),mitigationPlan:String(r.mitigationPlan||''),contingencyPlan:String(r.contingencyPlan||''),status:['ACTIVE','MITIGATED','CLOSED','OCCURRED'].includes(r.status)?r.status:'ACTIVE',identifiedDate:new Date().toISOString().split('T')[0]},user as any); if(out) applied.push({type:action.type,data:out}); break;
+        }
+        case 'update_risk': {
+          if (!RBAC.canManageRisks(user.role)) break; const out=dbStore.updateRisk(project.id,String(action.id),action.patch||{},user as any); if(out) applied.push({type:action.type,data:out}); break;
+        }
+      }
+    } catch (e) { console.warn('Copilot action ignorée:', e); }
+  }
+  return applied;
 }
 
 
@@ -2065,49 +2138,6 @@ app.get('/api/audit-logs', requireRole(RBAC.canAccessAdmin), (req: Request, res:
 
 
 
-
-// API: état/configuration Copilot Studio (aucun secret n'est renvoyé)
-app.get('/api/copilot-studio/status', requireAuth, (req: Request, res: Response) => {
-  res.json({ success: true, configured: Boolean(COPILOT_DIRECTLINE_TOKEN_ENDPOINT), agentId: COPILOT_AGENT_ID, environmentId: COPILOT_ENVIRONMENT_ID, tenantIdConfigured: Boolean(COPILOT_TENANT_ID), directLineConfigured: Boolean(COPILOT_DIRECTLINE_TOKEN_ENDPOINT) });
-});
-
-// API: chat Copilot Studio via Direct Line. Le token reste côté serveur.
-app.post('/api/projects/:id/copilot-studio', upload.array('files', 10), requireRole(RBAC.canManageProject), async (req: Request, res: Response) => {
-  try {
-    const project = dbStore.getProjectById(String(req.params.id));
-    if (!project) return res.status(404).json({ error: 'Projet introuvable.' });
-    const files = ((req as any).files || []) as Express.Multer.File[];
-    const message = String(req.body?.message || '').trim() || 'Analyse les documents fournis et compare-les au projet CLARITY.';
-    const evidence = files.length ? await extractDocumentEvidenceForCopilot(files) : '';
-    const context = { project, requestedAt: new Date().toISOString(), user: { id: currentUser(req).id, role: currentUser(req).role }, documents: files.map(f => ({ name: f.originalname, size: f.size, mimeType: f.mimetype })) };
-    const prompt = `Tu es l’agent Copilot Studio intégré à CLARITY PM. Analyse réellement les informations fournies. Ne rien inventer. Réponds en JSON strict avec {"reply":"...","analysis":{},"actions":[]}. Les actions sont des PROPOSITIONS uniquement et doivent cibler le projectId ${project.id}. Conserve les identifiants existants lorsque possible. CONTEXTE=${JSON.stringify(context)} DOCUMENTS=${evidence || '[aucun]'} DEMANDE=${message}`;
-    const session = await getCopilotStudioToken();
-    const result = await sendCopilotStudioMessage(session.token, session.conversationId, prompt, currentUser(req).id);
-    let parsed:any;
-    try { parsed = cleanCopilotJson(result.reply); } catch { parsed = { reply: result.reply, analysis: {}, actions: [] }; }
-    const actions = Array.isArray(parsed.actions) ? parsed.actions.map((a:any,i:number)=>normalizeCopilotAction(a,project,i)).filter(Boolean) : [];
-    const memory = await loadCopilotMemory(project.id,currentUser(req).id);
-    const history = [...(memory.history||[]), { role:'user', text:message, files:files.map(f=>({name:f.originalname,size:f.size})), meta:'Copilot Studio' }, { role:'assistant', text:String(parsed.reply||result.reply||''), analysis:parsed.analysis||{}, meta:`Copilot Studio · ${COPILOT_AGENT_ID}` }].slice(-100);
-    await saveCopilotMemory(project.id,currentUser(req).id,{...memory,evidence:evidence||memory.evidence,files:files.length?files.map(f=>({name:f.originalname,size:f.size,mimeType:f.mimetype})):memory.files,analysis:parsed.analysis||{},pendingActions:actions,history});
-    res.json({ success:true, data:{ reply:String(parsed.reply||result.reply||''), analysis:parsed.analysis||{}, actions, confirmation:{required:actions.length>0,message:actions.length?'Modifications proposées par Copilot Studio. Validation CLARITY requise.':''}, applied:[], project, provider:'COPILOT_STUDIO', model:COPILOT_AGENT_ID, conversationId:session.conversationId } });
-  } catch(e:any) { console.error('Copilot Studio error:',e); res.status(500).json({error:e?.message||'Copilot Studio indisponible.'}); }
-});
-
-// API d'actions pour un connecteur/plugin Copilot Studio. Cette route ne peut être appelée qu'avec CLARITY_API_KEY.
-app.post('/api/copilot/actions', requireClarityApiKey, async (req: Request, res: Response) => {
-  try {
-    const projectId=String(req.body?.projectId||'');
-    const project=projectId?dbStore.getProjectById(projectId):null;
-    if(!project) return res.status(404).json({error:'Projet introuvable.'});
-    const actions=Array.isArray(req.body?.actions)?req.body.actions:[];
-    if(!actions.length) return res.status(400).json({error:'actions[] est requis.'});
-    const systemUser:MicrosoftSessionUser={id:'copilot-studio',displayName:'Copilot Studio',email:'copilot@clarity.local',role:'DIRECTEUR_PROJETS',authProvider:'LOCAL',connectedAt:new Date().toISOString()};
-    const normalized=actions.map((a:any,i:number)=>normalizeCopilotAction(a,project,i)).filter(Boolean);
-    const result=applyCopilotActions(project,normalized,systemUser);
-    res.json({success:true,project:dbStore.getProjectById(project.id),applied:result.applied,failed:result.failed});
-  } catch(e:any) { res.status(500).json({error:e?.message||'Application Copilot impossible.'}); }
-});
-
 // API: mémoire du Copilot pour un projet
 app.get('/api/projects/:id/copilot', requireRole(RBAC.canManageProject), async (req: Request, res: Response) => {
   try {
@@ -2135,7 +2165,7 @@ app.post('/api/projects/:id/copilot', upload.array('files', 10), requireRole(RBA
     if (!project) return res.status(404).json({ error:'Projet introuvable.' });
     const files = ((req as any).files || []) as Express.Multer.File[];
     const message = String(req.body?.message || '').trim();
-    const result = await runGatewayCopilot(project, files, message, currentUser(req));
+    const result = await runCopilotStudio(project, files, message, currentUser(req));
     // IMPORTANT: Copilot never changes the project during analysis.
     // Actions returned by the AI are proposals and require explicit user confirmation.
     const proposedActions = Array.isArray(result.actions) ? result.actions : [];
