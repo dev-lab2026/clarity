@@ -1,0 +1,63 @@
+openapi: 3.0.3
+info:
+  title: CLARITY PM Copilot Actions API
+  version: 1.0.0
+servers:
+  - url: https://clarity.ferjani.duckdns.org
+paths:
+  /api/copilot/actions:
+    post:
+      operationId: applyCopilotActions
+      summary: Applique des actions projet produites par Copilot après validation de la politique Copilot.
+      security:
+        - clarityBearer: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [projectId, actions]
+              properties:
+                projectId:
+                  type: string
+                actions:
+                  type: array
+                  items:
+                    type: object
+                    required: [type, targetProjectId]
+                    properties:
+                      type:
+                        type: string
+                        enum: [update_project, add_task, update_task, add_milestone, update_milestone, add_risk, update_risk]
+                      targetProjectId:
+                        type: string
+                      proposalId:
+                        type: string
+                      id:
+                        type: string
+                      patch:
+                        type: object
+                        additionalProperties: true
+                      task:
+                        type: object
+                        additionalProperties: true
+                      milestone:
+                        type: object
+                        additionalProperties: true
+                      risk:
+                        type: object
+                        additionalProperties: true
+responses:
+  '200':
+    description: Actions appliquées ou rejetées individuellement.
+  '401':
+    description: Clé CLARITY invalide.
+  '404':
+    description: Projet introuvable.
+components:
+  securitySchemes:
+    clarityBearer:
+      type: http
+      scheme: bearer
+      bearerFormat: CLARITY_API_KEY
