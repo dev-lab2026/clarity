@@ -44,7 +44,10 @@ pipeline {
                     test -f docker-compose.yml
                     test -f package.json
 
-                    echo "✅ Code récupéré"
+                    echo "Commit déployé :"
+                    git rev-parse --short HEAD
+
+                    echo "Code récupéré"
                 '''
             }
         }
@@ -58,9 +61,9 @@ pipeline {
                     echo " Docker Build"
                     echo "======================================"
 
-                    docker compose build --pull app
+                    docker compose build --pull --no-cache app
 
-                    echo "✅ Image construite"
+                    echo "Image construite"
                 '''
             }
         }
@@ -76,7 +79,7 @@ pipeline {
 
                     if docker inspect "${POSTGRES_NAME}" >/dev/null 2>&1; then
 
-                        echo "✅ PostgreSQL existe déjà"
+                        echo "PostgreSQL existe déjà"
 
                         RUNNING=$(docker inspect \
                             -f '{{.State.Running}}' \
@@ -91,10 +94,9 @@ pipeline {
                         echo "PostgreSQL absent → création"
 
                         docker compose up -d postgres
-
                     fi
 
-                    echo "✅ PostgreSQL OK"
+                    echo "PostgreSQL OK"
                 '''
             }
         }
@@ -105,18 +107,18 @@ pipeline {
                     set -e
 
                     echo "======================================"
-                    echo " Clarity Application"
+                    echo " CLARITY RECREATE"
                     echo "======================================"
 
-                    echo "🛑 Suppression UNIQUEMENT de ${APP_NAME}"
+                    echo "Suppression de l'ancien conteneur..."
 
                     docker rm -f "${APP_NAME}" 2>/dev/null || true
 
-                    echo "🚀 Démarrage nouvelle version"
+                    echo "Création du nouveau conteneur..."
 
-                    docker compose up -d --no-deps app
+                    docker compose up -d --no-deps --force-recreate app
 
-                    echo "✅ Clarity démarrée"
+                    echo "Nouveau conteneur créé"
                 '''
             }
         }
@@ -132,11 +134,14 @@ pipeline {
 
                     sleep 10
 
-                    echo "Clarity:"
+                    echo ""
+                    echo "===== CLARITY ====="
+
                     docker ps --filter "name=${APP_NAME}"
 
                     echo ""
-                    echo "PostgreSQL:"
+                    echo "===== POSTGRES ====="
+
                     docker ps --filter "name=${POSTGRES_NAME}"
 
                     STATUS=$(docker inspect \
@@ -144,12 +149,16 @@ pipeline {
                         "${APP_NAME}")
 
                     if [ "$STATUS" != "running" ]; then
-                        echo "❌ Clarity n'est pas démarrée"
+
+                        echo "CLARITY n'est pas démarrée"
+
                         docker logs --tail 200 "${APP_NAME}" || true
+
                         exit 1
                     fi
 
-                    echo "✅ Clarity fonctionne"
+                    echo ""
+                    echo "CLARITY fonctionne"
                 '''
             }
         }
@@ -159,13 +168,13 @@ pipeline {
 
         success {
             echo '======================================'
-            echo '✅ DEPLOYMENT SUCCESS'
+            echo ' DEPLOYMENT SUCCESS'
             echo '======================================'
         }
 
         failure {
             echo '======================================'
-            echo '❌ DEPLOYMENT FAILED'
+            echo ' DEPLOYMENT FAILED'
             echo '======================================'
 
             sh '''
