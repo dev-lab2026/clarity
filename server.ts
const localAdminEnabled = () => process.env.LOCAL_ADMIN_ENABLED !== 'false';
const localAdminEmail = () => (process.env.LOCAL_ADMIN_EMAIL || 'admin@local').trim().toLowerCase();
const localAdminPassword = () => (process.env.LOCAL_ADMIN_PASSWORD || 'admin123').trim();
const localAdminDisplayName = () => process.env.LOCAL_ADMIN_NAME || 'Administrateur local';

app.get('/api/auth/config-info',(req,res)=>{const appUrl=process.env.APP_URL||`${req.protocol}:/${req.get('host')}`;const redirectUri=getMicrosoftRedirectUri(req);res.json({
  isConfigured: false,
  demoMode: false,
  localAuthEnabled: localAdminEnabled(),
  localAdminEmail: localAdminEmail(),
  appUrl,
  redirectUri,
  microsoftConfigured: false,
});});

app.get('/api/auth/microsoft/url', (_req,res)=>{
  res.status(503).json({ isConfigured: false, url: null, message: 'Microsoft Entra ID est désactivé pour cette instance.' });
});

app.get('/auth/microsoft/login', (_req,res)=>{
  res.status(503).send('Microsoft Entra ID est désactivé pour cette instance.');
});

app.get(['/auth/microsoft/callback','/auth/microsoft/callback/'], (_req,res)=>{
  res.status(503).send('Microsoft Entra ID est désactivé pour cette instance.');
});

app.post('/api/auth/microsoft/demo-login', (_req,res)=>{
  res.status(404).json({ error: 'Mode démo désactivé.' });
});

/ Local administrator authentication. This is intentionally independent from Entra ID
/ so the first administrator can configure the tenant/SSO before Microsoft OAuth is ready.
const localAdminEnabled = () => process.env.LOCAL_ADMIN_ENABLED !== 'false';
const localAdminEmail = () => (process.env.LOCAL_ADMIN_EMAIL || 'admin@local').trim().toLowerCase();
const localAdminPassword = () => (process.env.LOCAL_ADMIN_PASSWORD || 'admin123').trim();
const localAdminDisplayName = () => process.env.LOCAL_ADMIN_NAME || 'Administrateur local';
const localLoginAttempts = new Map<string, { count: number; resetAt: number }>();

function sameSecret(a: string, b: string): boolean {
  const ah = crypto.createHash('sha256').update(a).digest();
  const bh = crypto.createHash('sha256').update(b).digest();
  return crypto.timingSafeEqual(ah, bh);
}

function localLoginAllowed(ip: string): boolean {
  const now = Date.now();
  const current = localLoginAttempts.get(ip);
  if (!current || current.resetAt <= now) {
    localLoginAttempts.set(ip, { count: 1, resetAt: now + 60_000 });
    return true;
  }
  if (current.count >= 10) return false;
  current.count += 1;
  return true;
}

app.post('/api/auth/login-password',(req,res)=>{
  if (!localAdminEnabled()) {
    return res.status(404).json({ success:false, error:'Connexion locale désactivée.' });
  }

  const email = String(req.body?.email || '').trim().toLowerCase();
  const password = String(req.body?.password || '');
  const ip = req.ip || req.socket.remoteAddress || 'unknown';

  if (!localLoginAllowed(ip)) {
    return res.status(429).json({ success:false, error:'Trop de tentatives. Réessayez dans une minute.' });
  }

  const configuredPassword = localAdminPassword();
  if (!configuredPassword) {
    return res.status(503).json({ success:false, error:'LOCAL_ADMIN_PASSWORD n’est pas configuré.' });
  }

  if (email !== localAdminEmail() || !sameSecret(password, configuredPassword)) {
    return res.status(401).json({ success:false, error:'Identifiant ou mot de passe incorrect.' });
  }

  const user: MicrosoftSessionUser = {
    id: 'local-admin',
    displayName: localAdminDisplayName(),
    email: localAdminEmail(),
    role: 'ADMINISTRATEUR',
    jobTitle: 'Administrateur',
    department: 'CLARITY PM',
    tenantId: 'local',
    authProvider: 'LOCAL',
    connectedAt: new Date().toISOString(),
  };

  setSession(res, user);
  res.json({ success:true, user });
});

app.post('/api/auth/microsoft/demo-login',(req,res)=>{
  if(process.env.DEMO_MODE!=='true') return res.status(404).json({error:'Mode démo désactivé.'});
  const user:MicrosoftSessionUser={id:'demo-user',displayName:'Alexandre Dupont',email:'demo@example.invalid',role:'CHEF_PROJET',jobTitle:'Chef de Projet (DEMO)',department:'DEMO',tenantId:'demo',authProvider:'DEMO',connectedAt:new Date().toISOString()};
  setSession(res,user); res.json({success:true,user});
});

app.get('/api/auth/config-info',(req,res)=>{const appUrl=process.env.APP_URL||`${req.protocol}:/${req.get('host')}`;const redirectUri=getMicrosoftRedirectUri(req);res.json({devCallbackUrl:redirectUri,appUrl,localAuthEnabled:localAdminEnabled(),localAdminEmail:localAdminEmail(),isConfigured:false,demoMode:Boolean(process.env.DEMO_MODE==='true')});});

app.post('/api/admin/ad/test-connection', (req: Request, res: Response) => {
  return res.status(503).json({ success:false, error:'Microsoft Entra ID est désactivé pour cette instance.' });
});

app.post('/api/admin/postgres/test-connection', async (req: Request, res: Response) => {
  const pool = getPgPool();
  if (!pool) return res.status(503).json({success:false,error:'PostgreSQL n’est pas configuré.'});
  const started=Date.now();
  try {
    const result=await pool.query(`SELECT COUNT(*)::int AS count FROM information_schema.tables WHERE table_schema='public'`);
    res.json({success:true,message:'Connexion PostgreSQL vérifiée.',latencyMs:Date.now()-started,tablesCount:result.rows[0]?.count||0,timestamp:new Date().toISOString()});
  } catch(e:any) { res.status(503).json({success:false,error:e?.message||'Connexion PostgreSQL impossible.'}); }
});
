@@ -1,0 +1,120 @@
+import React, { useEffect, useState } from 'react';
+import { AlertCircle, KeyRound, RefreshCw } from 'lucide-react';
+import { MicrosoftUser } from '../types';
+
+interface LoginPageProps {
+  onLoginSuccess: (user: MicrosoftUser) => void;
+  currentUser?: MicrosoftUser | null;
+}
+
+export const LoginPage: React.FC<LoginPageProps> = ({ onLoginSuccess }) => {
+  const [loading, setLoading] = useState(false);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [localAuthEnabled, setLocalAuthEnabled] = useState(true);
+  const [adminEmailHint, setAdminEmailHint] = useState('admin@local');
+  const [email, setEmail] = useState('admin@local');
+  const [password, setPassword] = useState('admin123');
+
+  useEffect(() => {
+    fetch('/api/auth/config-info')
+      .then((r) => r.json())
+      .then((d) => {
+        setLocalAuthEnabled(d.localAuthEnabled !== false);
+        if (d.localAdminEmail) setAdminEmailHint(d.localAdminEmail);
+      })
+      .catch(() => {
+        setLocalAuthEnabled(true);
+      });
+  }, []);
+
+  const loginLocal = async (event: React.FormEvent) => {
+    event.preventDefault();
+    setLoading(true);
+    setErrorMsg(null);
+    try {
+      const res = await fetch('/api/auth/login-password', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email, password }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Connexion locale impossible.');
+      onLoginSuccess(data.user);
+    } catch (e: any) {
+      setErrorMsg(e.message || 'Connexion locale impossible.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="min-h-screen bg-[#f3f4f6] flex items-center justify-center p-6 text-slate-800">
+      <div className="w-full max-w-md bg-white border border-slate-200 rounded-2xl shadow-lg p-8 space-y-5">
+        <div className="flex items-center gap-3">
+          <div className="w-11 h-11 rounded-xl bg-indigo-600 text-white flex items-center justify-center font-black">CPM</div>
+          <div>
+            <div className="text-xl font-black">CLARITY <span className="text-indigo-600">PM</span></div>
+            <div className="text-xs text-slate-500">Cockpit de gestion de projets</div>
+          </div>
+        </div>
+
+        {errorMsg && (
+          <div className="p-3 bg-red-50 border border-red-200 rounded-lg text-xs text-red-700 flex gap-2">
+            <AlertCircle className="w-4 h-4 shrink-0" />
+            <span>{errorMsg}</span>
+          </div>
+        )}
+
+        {localAuthEnabled && (
+          <form onSubmit={loginLocal} className="space-y-3">
+            <div className="flex items-center gap-2 text-sm font-bold text-slate-800">
+              <KeyRound className="w-4 h-4 text-indigo-600" />
+              Accès administrateur local
+            </div>
+
+            <div className="rounded-lg border border-indigo-100 bg-indigo-50 px-3 py-2 text-[11px] text-indigo-800">
+              Compte par défaut : <span className="font-bold">{adminEmailHint}</span> / <span className="font-bold">admin123</span>
+            </div>
+
+            <input
+              type="email"
+              autoComplete="username"
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              placeholder={adminEmailHint}
+              className="w-full px-3 py-2.5 border border-slate-300 rounded-lg text-sm outline-none focus:ring-2 focus:ring-indigo-500"
+              required
+            />
+            <input
+              type="password"
+              autoComplete="current-password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              placeholder="Mot de passe administrateur"
+              className="w-full px-3 py-2.5 border border-slate-300 rounded-lg text-sm outline-none focus:ring-2 focus:ring-indigo-500"
+              required
+            />
+            <button
+              type="submit"
+              disabled={loading}
+              className="w-full py-3 px-4 bg-indigo-600 hover:bg-indigo-700 text-white font-semibold text-sm rounded-lg flex items-center justify-center gap-2 disabled:opacity-50"
+            >
+              {loading ? <RefreshCw className="w-4 h-4 animate-spin" /> : <span>Se connecter comme administrateur</span>}
+            </button>
+            <p className="text-[11px] text-slate-500">
+              L’authentification Microsoft Entra ID est désactivée pour cette instance. Le compte local admin sert à gérer les profils et les rôles.
+            </p>
+          </form>
+        )}
+
+        {!localAuthEnabled && (
+          <div className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-xs text-amber-800">
+            L’accès local est désactivé. Activez LOCAL_ADMIN_ENABLED=true pour réactiver l’admin local.
+          </div>
+        )}
+      </div>
+    </div>
+  );
+};
+
+export default LoginPage;
