@@ -1,10 +1,11 @@
-pipeline {
 
+pipeline {
     agent any
 
     environment {
         APP_NAME = 'prometric-app'
         POSTGRES_NAME = 'prometric-postgres'
+        COMPOSE_PROJECT_NAME = 'clarity'
     }
 
     triggers {
@@ -20,7 +21,7 @@ pipeline {
 
     stages {
 
-        stage('COPY FROM GITHUB') {
+        stage('CHECKOUT') {
             steps {
                 deleteDir()
 
@@ -34,36 +35,33 @@ pipeline {
                 ])
 
                 sh '''
-                    set -e
+                    set -eu
 
-                    echo "======================================"
-                    echo " GitHub → Jenkins"
-                    echo "======================================"
+                    echo "=== GITHUB CHECKOUT ==="
 
                     test -f Dockerfile
                     test -f docker-compose.yml
                     test -f package.json
 
-                    echo "Commit déployé :"
+                    echo "Commit:"
                     git rev-parse --short HEAD
 
-                    echo "Code récupéré"
+                    echo "Validation Docker Compose:"
+                    docker compose -p clarity config -q
                 '''
             }
         }
 
-        stage('DOCKER BUILD') {
+        stage('BUILD') {
             steps {
                 sh '''
-                    set -e
+                    set -eu
 
-                    echo "======================================"
-                    echo " Docker Build"
-                    echo "======================================"
+                    echo "=== BUILD CLARITY ==="
 
-                    docker compose build --pull --no-cache app
+                    docker compose -p clarity build app
 
-                    echo "Image construite"
+                    echo "Build terminé"
                 '''
             }
         }
@@ -71,128 +69,149 @@ pipeline {
         stage('START POSTGRES') {
             steps {
                 sh '''
-                    set -e
+                    set -eu
 
-                    echo "======================================"
-                    echo " PostgreSQL"
-                    echo "======================================"
+                    echo "=== POSTGRESQL ==="
 
-                    if docker inspect "${POSTGRES_NAME}" >/dev/null 2>&1; then
-
-                        echo "PostgreSQL existe déjà"
+                    if docker inspect "$POSTGRES_NAME" >/dev/null 2>&1; then
+                        echo "PostgreSQL existe"
 
                         RUNNING=$(docker inspect \
-                            -f '{{.State.Running}}' \
-                            "${POSTGRES_NAME}")
+                            -f '{{.State.Running}}' "$POSTGRES_NAME")
 
                         if [ "$RUNNING" != "true" ]; then
-                            docker start "${POSTGRES_NAME}"
+                            docker start "$POSTGRES_NAME"
                         fi
-
                     else
+                        echo "Création PostgreSQL via Compose"
 
-                        echo "PostgreSQL absent → création"
-
-                        docker compose up -d postgres
+                        docker compose -p clarity up -d postgres
                     fi
 
-                    echo "PostgreSQL OK"
+                    echo "Attente PostgreSQL..."
+
+                    READY=false
+
+                    for i in $(seq 1 30); do
+                        if docker exec "$POSTGRES_NAME" pg_isready -q; then
+                            READY=true
+                            break
+                        fi
+
+                        sleep 2
+                    done
+
+                    if [ "$READY" != "true" ]; then
+                        echo "PostgreSQL ne répond pas"
+                        docker logs --tail 100 "$POSTGRES_NAME" || true
+                        exit 1
+                    fi
+
+                    echo "PostgreSQL opérationnel"
                 '''
             }
         }
 
-        stage('DEPLOY APP') {
+        stage('DEPLOY CLARITY') {
             steps {
                 sh '''
-                    set -e
+                    set -eu
 
-                    echo "======================================"
-                    echo " CLARITY RECREATE"
-                    echo "======================================"
+                    echo "=== DEPLOY CLARITY ==="
 
-                    echo "Suppression de l'ancien conteneur..."
+                    docker compose -p clarity up -d \
+                        --no-deps \
+                        --force-recreate \
+                        app
 
-                    docker rm -f "${APP_NAME}" 2>/dev/null || true
-
-                    echo "Création du nouveau conteneur..."
-
-                    docker compose up -d --no-deps --force-recreate app
-
-                    echo "Nouveau conteneur créé"
+                    echo "Conteneur recréé"
                 '''
             }
         }
 
-        stage('VERIFY') {
+        stage('HEALTH CHECK') {
             steps {
                 sh '''
-                    set -e
+                    set -eu
 
-                    echo "======================================"
-                    echo " Vérification"
-                    echo "======================================"
+                    echo "=== HEALTH CHECK ==="
 
-                    sleep 10
+                    READY=false
 
-                    echo ""
-                    echo "===== CLARITY ====="
+                    for i in $(seq 1 30); do
 
-                    docker ps --filter "name=${APP_NAME}"
+                        STATUS=$(docker inspect \
+                            -f '{{.State.Status}}' "$APP_NAME" 2>/dev/null || echo missing)
 
-                    echo ""
-                    echo "===== POSTGRES ====="
+                        HEALTH=$(docker inspect \
+                            -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' \
+                            "$APP_NAME" 2>/dev/null || echo missing)
 
-                    docker ps --filter "name=${POSTGRES_NAME}"
+                        echo "Status=$STATUS Health=$HEALTH"
 
-                    STATUS=$(docker inspect \
-                        -f '{{.State.Status}}' \
-                        "${APP_NAME}")
+                        if [ "$STATUS" = "running" ]; then
+                            if [ "$HEALTH" = "healthy" ] || [ "$HEALTH" = "none" ]; then
+                                READY=true
+                                break
+                            fi
 
-                    if [ "$STATUS" != "running" ]; then
+                            if [ "$HEALTH" = "unhealthy" ]; then
+                                break
+                            fi
+                        fi
 
-                        echo "CLARITY n'est pas démarrée"
+                        sleep 2
+                    done
 
-                        docker logs --tail 200 "${APP_NAME}" || true
+                    if [ "$READY" != "true" ]; then
+                        echo "ECHEC DU DEPLOIEMENT"
+
+                        docker ps -a --filter "name=$APP_NAME"
+                        docker logs --tail 200 "$APP_NAME" || true
 
                         exit 1
                     fi
 
-                    echo ""
-                    echo "CLARITY fonctionne"
+                    echo "=== CONTENEURS ==="
+                    docker ps --filter "name=$APP_NAME"
+                    docker ps --filter "name=$POSTGRES_NAME"
+
+                    echo "Clarity démarrée"
                 '''
             }
         }
     }
 
     post {
-
         success {
-            echo '======================================'
-            echo ' DEPLOYMENT SUCCESS'
-            echo '======================================'
+            echo '''
+            =====================================
+              CLARITY DEPLOYMENT SUCCESS
+            =====================================
+            '''
         }
 
         failure {
-            echo '======================================'
-            echo ' DEPLOYMENT FAILED'
-            echo '======================================'
+            echo '''
+            =====================================
+              CLARITY DEPLOYMENT FAILED
+            =====================================
+            '''
 
             sh '''
-                echo "===== CLARITY ====="
+                echo "=== APP ==="
                 docker ps -a --filter "name=prometric-app" || true
 
-                echo ""
-                echo "===== POSTGRES ====="
+                echo "=== POSTGRES ==="
                 docker ps -a --filter "name=prometric-postgres" || true
 
-                echo ""
-                echo "===== CLARITY LOGS ====="
+                echo "=== APP LOGS ==="
                 docker logs --tail 200 prometric-app 2>/dev/null || true
             '''
         }
 
         always {
-            echo 'Pipeline terminé — aucun nettoyage Docker global effectué.'
+            echo 'Pipeline terminé. Aucun nettoyage global Docker.'
         }
     }
 }
