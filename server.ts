@@ -1,128 +1,96 @@
+import 'dotenv/config';
+import express, { Request, Response, NextFunction } from 'express';
+import path from 'path';
+import fs from 'fs';
+import crypto from 'node:crypto';
+import multer from 'multer';
+import * as XLSX from 'xlsx';
+import { createServer as createViteServer } from 'vite';
+import { dbStore, getPgPool } from './src/db/dbClient';
+import { UserRole, MicrosoftUser, UserProfile, Project } from './src/types';
+import { ensureAIConfigTable, getAIConfig, getAISecret, publicAIConfig, saveAIConfig } from './src/server_ai_config';
+import { ensureAIGatewayTable, callGatewayText } from './src/ai_gateway';
+import { ensureAIRouterTable, listAIRouterAccounts, saveAIRouterAccount, deleteAIRouterAccount, getGeminiModelCatalog } from './src/ai_router';
 
-  if (!milestone) return res.status(404).json({ error: 'Projet introuvable.' });
-  res.status(201).json({ success: true, data: milestone });
+const app = express();
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
+const PORT = Number(process.env.PORT || 3000);
+const SESSION_COOKIE = 'pm_session';
+const SESSION_TTL_SECONDS = 8 * 60 * 60;
+const OAUTH_STATE_TTL_MS = 10 * 60 * 1000;
+
+app.disable('x-powered-by');
+app.use(express.json({ limit: '2mb' }));
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+  next();
 });
 
-app.put('/api/projects/:id/milestones/:mId', requireRole(RBAC.canManageProject), (req: Request, res: Response) => {
-  const user = currentUser(req);
-  const updated = dbStore.updateMilestone(req.params.id, req.params.mId, req.body, user);
-  if (!updated) return res.status(404).json({ error: 'Jalon introuvable.' });
-  res.json({ success: true, data: updated });
-});
+interface MicrosoftSessionUser {
+  id: string; displayName: string; email: string; role: UserRole;
+  jobTitle?: string; department?: string; officeLocation?: string; avatarUrl?: string;
+  tenantId?: string; authProvider: 'MICROSOFT_ENTRA' | 'MICROSOFT_LIVE' | 'LOCAL' | 'DEMO'; connectedAt: string;
+}
 
-app.delete('/api/projects/:id/milestones/:mId', requireRole(RBAC.canManageProject), (req: Request, res: Response) => {
-  const user = currentUser(req);
-  const success = dbStore.deleteMilestone(req.params.id, req.params.mId, user);
-  if (!success) return res.status(404).json({ error: 'Jalon introuvable.' });
-  res.json({ success: true, message: 'Jalon supprimé.' });
-});
+const ROLE_VALUES: UserRole[] = ['ADMINISTRATEUR','DIRECTEUR_PROJETS','PMO','CHEF_PROJET','CONTRIBUTEUR'];
+const roleForEmail = (email: string): UserRole => {
+  const normalized = email.toLowerCase();
+  const adminEmails = (process.env.ADMIN_EMAILS || '').split(',').map(v=>v.trim().toLowerCase()).filter(Boolean);
+  const directorEmails = (process.env.DIRECTOR_EMAILS || '').split(',').map(v=>v.trim().toLowerCase()).filter(Boolean);
+  const pmoEmails = (process.env.PMO_EMAILS || '').split(',').map(v=>v.trim().toLowerCase()).filter(Boolean);
+  if (adminEmails.includes(normalized)) return 'ADMINISTRATEUR';
+  if (directorEmails.includes(normalized)) return 'DIRECTEUR_PROJETS';
+  if (pmoEmails.includes(normalized)) return 'PMO';
+  return 'CHEF_PROJET';
+};
 
-// 8. Audit Logs Endpoint
-app.get('/api/audit-logs', requireRole(RBAC.canAccessAdmin), (req: Request, res: Response) => {
-  const logs = dbStore.getAuditLogs(100);
-  res.json({ success: true, count: logs.length, data: logs });
-});
+const secret = () => process.env.JWT_SECRET || (process.env.NODE_ENV === 'production' ? '' : 'development-only-change-me');
+function signSession(user: MicrosoftSessionUser) {
+  const key = secret(); if (!key) throw new Error('JWT_SECRET doit être configuré en production.');
+  const payload = Buffer.from(JSON.stringify({ user, exp: Math.floor(Date.now()/1000)+SESSION_TTL_SECONDS })).toString('base64url');
+  const sig = crypto.createHmac('sha256', key).update(payload).digest('base64url');
+  return `${payload}.${sig}`;
+}
+function verifySession(token?: string): MicrosoftSessionUser | null {
+  if (!token) return null; const key=secret(); if(!key) return null;
+  const [payload,sig]=token.split('.'); if(!payload||!sig)return null;
+  const expected=crypto.createHmac('sha256',key).update(payload).digest('base64url');
+  if(sig.length!==expected.length || !crypto.timingSafeEqual(Buffer.from(sig),Buffer.from(expected)))return null;
+  try { const data=JSON.parse(Buffer.from(payload,'base64url').toString()); if(data.exp < Math.floor(Date.now()/1000)) return null; return data.user as MicrosoftSessionUser; } catch { return null; }
+}
+function parseCookies(header='') { return Object.fromEntries(header.split(';').map(v=>v.trim().split('=').map(decodeURIComponent)).filter(v=>v.length===2)); }
+function setSession(res: Response, user: MicrosoftSessionUser) {
+  const appUrl = process.env.APP_URL || '';
+  const secureCookie = process.env.COOKIE_SECURE === 'true' || (process.env.COOKIE_SECURE !== 'false' && appUrl.startsWith('https://'));
+  const secure = secureCookie ? '; Secure' : '';
+  res.setHeader('Set-Cookie', `${SESSION_COOKIE}=${encodeURIComponent(signSession(user))}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${SESSION_TTL_SECONDS}${secure}`);
+}
+function clearSession(res: Response) { res.setHeader('Set-Cookie', `${SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`); }
+function getUserFromRequest(req: Request): MicrosoftSessionUser | null { return verifySession(parseCookies(req.headers.cookie || '')[SESSION_COOKIE]); }
+function requireAuth(req: Request, res: Response, next: NextFunction) {
+  const user=getUserFromRequest(req); if(!user)return res.status(401).json({error:'Authentification requise.'});
+  (req as any).user=user; next();
+}
+const currentUser = (req: Request) => (req as any).user as MicrosoftSessionUser;
 
+const RBAC = {
+  canCreateOrDeleteProject:(r:UserRole)=>r==='DIRECTEUR_PROJETS',
+  canManageProject:(r:UserRole)=>r==='DIRECTEUR_PROJETS'||r==='CHEF_PROJET'||r==='PMO',
+  canManageResources:(r:UserRole)=>r==='DIRECTEUR_PROJETS'||r==='CHEF_PROJET',
+  canManageTasks:(r:UserRole)=>r==='DIRECTEUR_PROJETS'||r==='CHEF_PROJET'||r==='PMO'||r==='CONTRIBUTEUR',
+  canManageRisks:(r:UserRole)=>r==='DIRECTEUR_PROJETS'||r==='CHEF_PROJET'||r==='PMO',
+  canAccessAdmin:(r:UserRole)=>r==='ADMINISTRATEUR',
+  canAccessPortfolio:(r:UserRole)=>r==='DIRECTEUR_PROJETS'||r==='PMO'||r==='ADMINISTRATEUR',
+};
+const requireRole=(check:(r:UserRole)=>boolean)=>(req:Request,res:Response,next:NextFunction)=>{ const u=currentUser(req); if(!check(u.role))return res.status(403).json({error:'Droits insuffisants.',userRole:u.role}); next(); };
+const requireOrigin=(req:Request,res:Response,next:NextFunction)=>{
+  if(['GET','HEAD','OPTIONS'].includes(req.method))return next();
+  const origin=req.headers.origin; const appUrl=process.env.APP_URL;
+  if(origin && appUrl && origin !== appUrl.replace(/\/$/,'')) return res.status(403).json({error:'Origine non autorisée.'});
+  next();
+};
 
-
-// API: mémoire du Copilot pour un projet
-app.get('/api/projects/:id/copilot', requireRole(RBAC.canManageProject), async (req: Request, res: Response) => {
-  try {
-    const project=dbStore.getProjectById(String(req.params.id));
-    if(!project) return res.status(404).json({error:'Projet introuvable.'});
-    const memory=await loadCopilotMemory(project.id,currentUser(req).id);
-    res.json({success:true,data:{history:memory.history||[],files:memory.files||[],analysis:memory.analysis||{},pendingActions:memory.pendingActions||[]}});
-  } catch(e:any) { res.status(500).json({error:e?.message||'Mémoire Copilot indisponible.'}); }
-});
-
-// API: CLARITY PM Copilot — chat + analyse documentaire + actions projet
-app.get('/api/projects/:id/copilot/proposals.json', requireRole(RBAC.canManageProject), async (req: Request, res: Response) => {
-  try {
-    const project=dbStore.getProjectById(String(req.params.id));
-    if(!project) return res.status(404).json({error:'Projet introuvable.'});
-    const user=currentUser(req);
-    const memory=await loadCopilotMemory(project.id,user.id);
-    res.json({version:1,project:{id:project.id,code:project.code,name:project.name},generatedAt:new Date().toISOString(),proposals:Array.isArray(memory.pendingActions)?memory.pendingActions:[]});
-  } catch(e:any) { res.status(500).json({error:e?.message||'Impossible de charger le JSON des propositions.'}); }
-});
-
-app.post('/api/projects/:id/copilot', upload.array('files', 10), requireRole(RBAC.canManageProject), async (req: Request, res: Response) => {
-  try {
-    const project = dbStore.getProjectById(String(req.params.id));
-    if (!project) return res.status(404).json({ error:'Projet introuvable.' });
-    const files = ((req as any).files || []) as Express.Multer.File[];
-    const message = String(req.body?.message || '').trim();
-    const result = await runCopilotStudio(project, files, message, currentUser(req));
-    // IMPORTANT: Copilot never changes the project during analysis.
-    // Actions returned by the AI are proposals and require explicit user confirmation.
-    const proposedActions = Array.isArray(result.actions) ? result.actions : [];
-    const confirmation = proposedActions.length > 0 ? {
-      required: true,
-      message: 'J’ai identifié des modifications possibles. Voulez-vous les appliquer au projet ?',
-      actions: proposedActions
-    } : { required: false, message: '', actions: [] };
-    res.json({ success:true, data:{ reply:result.reply || '', analysis:result.analysis || {}, actions:proposedActions, confirmation, applied:[], project, provider:result.provider, account:result.account, model:result.model } });
-  } catch (e:any) {
-    console.error('Copilot error:', e);
-    const status = Number(e?.status) === 401 ? 401 : 500;
-    res.status(status).json({ error:e?.message || 'Copilot indisponible.' });
-  }
-});
-
-// API: refuser les propositions en attente sans modifier le projet
-app.post('/api/projects/:id/copilot/reject', requireRole(RBAC.canManageProject), async (req: Request, res: Response) => {
-  try {
-    const project=dbStore.getProjectById(String(req.params.id));
-    if(!project) return res.status(404).json({error:'Projet introuvable.'});
-    const user=currentUser(req); const memory=await loadCopilotMemory(project.id,user.id);
-    await saveCopilotMemory(project.id,user.id,{...memory,pendingActions:[]});
-    res.json({success:true,data:{pendingActions:[]}});
-  } catch(e:any){ res.status(500).json({error:e?.message||'Impossible de refuser les propositions.'}); }
-});
-
-// API: appliquer explicitement les propositions du Copilot après confirmation utilisateur
-app.post('/api/projects/:id/copilot/apply', requireRole(RBAC.canManageProject), async (req: Request, res: Response) => {
-  try {
-    const project = dbStore.getProjectById(String(req.params.id));
-    if (!project) return res.status(404).json({ error:'Projet introuvable.' });
-    if (req.body?.confirmed !== true) return res.status(400).json({ error:'Confirmation utilisateur requise.' });
-    const user = currentUser(req);
-    const memory = await loadCopilotMemory(project.id, user.id);
-    const storedActions = Array.isArray(memory.pendingActions) ? memory.pendingActions : [];
-    if (!storedActions.length) return res.status(400).json({ error:'Aucune proposition en attente à appliquer.' });
-    const proposalIds = Array.isArray(req.body?.proposalIds) ? req.body.proposalIds.map(String) : [];
-    const requested = proposalIds.length ? storedActions.filter((a:any)=>proposalIds.includes(String(a.proposalId||a._key))) : storedActions;
-    if (!requested.length) return res.status(400).json({ error:'Aucune modification sélectionnée.', code:'NO_SELECTED_PROPOSALS' });
-    const result = applyCopilotActions(project, requested, user);
-    const appliedIds = new Set(result.applied.map((x:any)=>String(x.proposalId)));
-    const remaining = storedActions.filter((a:any)=>!appliedIds.has(String(a.proposalId||a._key)));
-    await saveCopilotMemory(project.id, user.id, { ...memory, pendingActions: remaining });
-    const updated = dbStore.getProjectById(project.id);
-    res.json({ success:true, data:{ applied:result.applied, failed:result.failed, appliedCount:result.applied.length, failedCount:result.failed.length, remainingProposals:remaining.length, project:updated } });
-  } catch (e:any) {
-    console.error('Copilot apply error:', e);
-    res.status(500).json({ error:e?.message || 'Impossible d’appliquer les modifications du Copilot.' });
-  }
-});
-
-// Vite middleware & Static Serving
-async function startServer() {
-  await dbStore.initialize();
-  await ensureAIConfigTable();
-  await ensureCopilotMemoryTable();
-  if (process.env.NODE_ENV !== 'production') {
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: 'spa',
-    });
-    app.use(vite.middlewares);
-  } else {
-    const distPath = path.join(process.cwd(), 'dist');
-    app.use(express.static(distPath));
-    app.get('*', (req: Request, res: Response) => {
-      res.sendFile(path.join(distPath, 'index.html'));
-    });
-  }
-
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Server running on http://0.0.0.0:${PORT}`);
+// CSRF/origin guard for all state-changing HTTP requests. Public OAuth GET callbacks remain unaffected.
